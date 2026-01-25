@@ -1,0 +1,39 @@
+QuickBooks Export Project - Current Summary
+Current Flow (Manual → Automated)
+
+Manual process: 
+Run 5 reports → Export data to Excel → Then run a Gogoel Sheet Code that reads a Google Sheets Tab for what reports go to what tabs, where to start the date in each tab for each report and then do it.
+
+I do this for 5 clients on 5 different QuickBooks account and 5 different workspaces.  All but 1 I have a gmail account in the workspace.  The other I do not which makes coding harder.  But I think I can ask for one.
+
+
+What to automate this.  
+Things we know about:
+   Google Sheets Tab that has all Source excel filename  ->   Destination Google Sheet Tab Google File ID.   Row to start, How for in the data to go column wise and row wise.  Mainly when it sees a TOTAL in a column or in a ROW and to stop before that row/column.  Or to overwrite all columns to the right and all rows before the start point.  This keeps my data exactly where I know it should be so I can run spreadsheet queries against it.
+
+
+I want to run the Frequency of this app: either Daily or weekly via Windows Task Scheduler.
+
+The basic Reports Currently Automated (there are more as listed in the ToProcess tab that has all the detail on what to do)
+
+Report Name	Display	Basis	Columns	                Destination Tab
+Balance Sheet	Months	Accrual	All rows/columns	"BalanceSheet_Weekly"
+Balance Sheet	Weekly	Accrual	All rows/columns	"BalanceSheet_Weekly"
+AR	        Detail	N/A	Periods in AR every 15 days, 6 periods, Customer balance detail	"AR_Detail"
+P&L        	Months	Cash	All rows/columns	"PnL_Cash_Monthly"
+P&L	        Months	Accrual	All rows/columns	"PnL_Monthly"
+Sales by Customer	Quarterly	Accrual	Summary by customer	"SalesByCustomer_Qtr"
+
+
+As these reports are copied into the tabs, the line that is read that processes the data in the ToProcess tab, it updates the date/tiome in Column K.  But you will need to read to column labels (Processed Date column) in row 1 to be sure of everything.
+
+The AR report has a special process and Spreadsheet it uses.  Again the "Google Sheet ID" is in the tab ToProcess, but it duplicates a tab in the spreadsheet called:  TEMP (See the column "Temp" in ToProcess to know the Tab name). it then Set the copied Tab to the format  YYYY-MM-DD (again this is in the ToProcess tab under the New Tab Name column)
+
+The Starting Cell for each Tab that data is being written in is located in the Column "Google Sheet starting cell" This is where you start the data to be placed (Values only). I always ignore the header details of a report.   The ToProcess also have two other columns Row Max and Column Max.  These indicate how far to go.  T means continue UNTIL you copy over the word TOTAL in column B.  * Means all rows/columns.  -T means stop right before you write the TOTAL in a row in Column B.
+
+the other Column I am adding, L (QBO Report name)  is the report name in QuickBooks.  I will list it as you tell the internal names you need.   But here are the ones for this customer: Balance Sheet, AR Aging, Profit and Loss, Sales by Customer Summary, Sales by Product Summary. 
+
+
+Again on completion, I want to have the TAB ToProcess list the new date/time in the Processed Date column for each read/write if successful.
+
+1Dlgdlq2VRRLiAexXwLPM_0x32Ovkg7D43Jt_GyIFUXM

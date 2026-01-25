@@ -1,0 +1,19 @@
+# Consolidated Project Requirements
+# All dependencies needed for standalone operation
+
+# Google APIs
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-httplib2>=0.1.1
+google-auth-oauthlib>=1.1.0
+
+# HubSpot API
+hubspot-api-client>=8.0.0
+
+# HTTP & Web
+requests>=2.31.0
+requests-oauthlib>=1.3.0
+beautifulsoup4>=4.11.0
+
+# Environment & Config
+python-dotenv>=1.0.0
