@@ -19,6 +19,7 @@ GOOGLE_SCOPES = [
 
 # ToProcess tab configuration
 TOPROCESS_TAB_NAME = "ToProcess"
+AUTOPROCESS_TAB_NAME = "AutoProcess"
 TOPROCESS_COLUMNS = {
     "year_cell": "A1",
     "row_max": "D",
@@ -44,10 +45,13 @@ QBO_REPORTS = {
     "Balance Sheet": "BalanceSheet",
     "P&L": "ProfitAndLoss",
     "Profit and Loss": "ProfitAndLoss",
+    "Profit and Loss Comparison": "ProfitAndLoss",
     "AR Aging": "AgedReceivables",
     "AR Aging Summary": "AgedReceivablesSummary",
+    "AR Summary": "AgedReceivablesSummary",
     "Sales by Customer Summary": "CustomerSales",
     "Sales by Product Summary": "ItemSales",
+    "Sales by Product/Service Summary": "ItemSales",
 }
 
 # Report display options
@@ -58,6 +62,9 @@ REPORT_DISPLAY = {
     "Yearly": "Years",
     "Detail": "Detail",
     "Summary": "Summary",
+    "TOTAL": "Total",
+    "Year": "Year",
+    "Biweekly": "Biweekly",
 }
 
 # Accounting basis options

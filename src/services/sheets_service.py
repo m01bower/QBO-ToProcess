@@ -12,7 +12,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build, Resource
 from googleapiclient.errors import HttpError
 
-from config import GOOGLE_SCOPES, TOPROCESS_TAB_NAME
+from config import GOOGLE_SCOPES, TOPROCESS_TAB_NAME, AUTOPROCESS_TAB_NAME
 from settings import (
     get_service_account_path,
     get_google_credentials_path,
@@ -229,6 +229,95 @@ class SheetsService:
 
         except HttpError as e:
             logger.error(f"Failed to read ToProcess config: {e}")
+            return None, []
+
+    def read_autoprocess_config(
+        self,
+        spreadsheet_id: str,
+    ) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+        """
+        Read the AutoProcess configuration tab.
+
+        Layout:
+            A1 = year
+            Row 2+ = data (row 1 is blank/header, skipped)
+            Columns: A=qbo_file_id, B=report_name, C=date_range,
+                     D=display, E=basis, F=special_options
+
+        Args:
+            spreadsheet_id: Google Sheet ID
+
+        Returns:
+            Tuple of (year, list of report configs)
+        """
+        try:
+            # Get the year from A1
+            year_result = self.sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{AUTOPROCESS_TAB_NAME}'!A1",
+            ).execute()
+
+            year_value = year_result.get("values", [[None]])[0][0]
+            try:
+                year = int(year_value)
+            except (ValueError, TypeError):
+                year = datetime.now().year
+                logger.warning(f"Could not parse year from A1, using current year: {year}")
+
+            # Get all data from row 3 onwards (row 1 = year, row 2 = headers)
+            data_result = self.sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{AUTOPROCESS_TAB_NAME}'!A3:F100",
+            ).execute()
+
+            rows = data_result.get("values", [])
+
+            configs = []
+            for row_idx, row in enumerate(rows):
+                # Skip empty rows
+                if not row or len(row) < 2:
+                    continue
+
+                # Safe column access
+                def get_col(idx: int, default: str = "") -> str:
+                    return row[idx].strip() if idx < len(row) and row[idx] else default
+
+                report_name = get_col(1)
+                if not report_name:
+                    continue  # Skip rows without a report name
+
+                date_range = get_col(2, "Year")
+                display = get_col(3, "Monthly")
+                basis = get_col(4, "Accrual")
+                special_options = get_col(5)
+
+                # Normalize basis
+                if basis.upper() == "CASH":
+                    basis = "Cash"
+                elif basis.upper() == "ACCRUAL":
+                    basis = "Accrual"
+
+                # Backward compat: if display is blank and special_options
+                # contains "2 Weeks", treat as Biweekly display
+                if not get_col(3) and "2 Weeks" in special_options:
+                    display = "Biweekly"
+
+                config = {
+                    "row_index": row_idx + 3,  # 1-indexed sheet row (data starts row 3)
+                    "qbo_file_id": get_col(0),
+                    "report_name": report_name,
+                    "date_range": date_range,
+                    "display": display,
+                    "basis": basis,
+                    "special_options": special_options,
+                }
+                configs.append(config)
+
+            logger.info(f"Loaded {len(configs)} AutoProcess configurations for year {year}")
+            return year, configs
+
+        except HttpError as e:
+            logger.error(f"Failed to read AutoProcess config: {e}")
             return None, []
 
     def verify_sheet_access(self, spreadsheet_id: str) -> bool:

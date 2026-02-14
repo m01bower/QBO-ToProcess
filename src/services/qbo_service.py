@@ -311,6 +311,8 @@ class QBOService:
         display: str = "Monthly",
         basis: str = "Accrual",
         full_year: bool = False,
+        date_range: str = "Year",
+        special_options: str = "",
     ) -> Optional[Dict[str, Any]]:
         """
         Fetch a report from QuickBooks.
@@ -321,6 +323,9 @@ class QBOService:
             display: Display type (Monthly, Quarterly, etc.)
             basis: Accounting basis (Cash, Accrual)
             full_year: If True, always use Jan 1 - Dec 31 (don't cap at today)
+            date_range: Date range override ("Year", "ALL", or custom)
+            special_options: Comma-separated special processing flags
+                             (e.g., "Comparison", product names for filtering)
 
         Returns:
             Report data dictionary or None
@@ -335,12 +340,26 @@ class QBOService:
         params = {}
 
         # Date parameters based on report type
-        start_date = f"{year}-01-01"
-        end_date = f"{year}-12-31"
+        today = date.today()
+
+        # Handle date_range overrides
+        if date_range.upper() == "ALL":
+            start_date = "2000-01-01"
+            # End at year-end, or today if current year
+            if year >= today.year:
+                end_date = today.isoformat()
+            else:
+                end_date = f"{year}-12-31"
+        else:
+            start_date = f"{year}-01-01"
+            end_date = f"{year}-12-31"
+
+        # Handle "Comparison" special option: expand to prior year
+        if "Comparison" in special_options:
+            start_date = f"{year - 1}-01-01"
 
         # Cap end date at today if in current year (unless full_year requested)
-        today = date.today()
-        if not full_year and year == today.year:
+        if not full_year and year == today.year and date_range.upper() != "ALL":
             end_date = today.isoformat()
 
         if qbo_report in ["BalanceSheet"]:
@@ -370,19 +389,27 @@ class QBOService:
                 params["summarize_column_by"] = "Month"
             elif display.lower() in ["quarterly", "quarters"]:
                 params["summarize_column_by"] = "Quarter"
-            elif display.lower() in ["yearly", "years"]:
+            elif display.lower() in ["yearly", "years", "year"]:
                 params["summarize_column_by"] = "Year"
+            elif display.lower() in ["weekly", "weeks"]:
+                params["summarize_column_by"] = "Week"
+            elif display.lower() == "total":
+                params["summarize_column_by"] = "Total"
         elif qbo_report in ["AgedReceivables", "AgedReceivablesSummary"]:
             # AR reports use as_of date
             params["report_date"] = today.isoformat()
-            params["aging_period"] = "15"
+            if display.lower() == "biweekly":
+                params["aging_period"] = "14"
+            else:
+                params["aging_period"] = "15"
             params["num_periods"] = "6"
 
         # Accounting basis
         if basis.lower() in ["cash", "accrual"]:
             params["accounting_method"] = basis.capitalize()
 
-        logger.info(f"Fetching {report_name} report for {year} ({display}, {basis})")
+        logger.info(f"Fetching {report_name} report for {year} ({display}, {basis})"
+                     f"{f' [{special_options}]' if special_options else ''}")
 
         result = self._make_request("GET", f"reports/{qbo_report}", params)
         return result
