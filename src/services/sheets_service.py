@@ -81,7 +81,7 @@ class SheetsService:
         """Authenticate using OAuth (browser flow)."""
         creds = None
         token_path = get_google_token_path(self.client_name)
-        credentials_path = get_google_credentials_path()
+        credentials_path = get_google_credentials_path(self.client_name)
 
         # Load existing token if available
         if token_path.exists():

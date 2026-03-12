@@ -1,8 +1,5 @@
 """Configuration constants for QBO ToProcess."""
 
-# Client names
-CLIENTS = ["BostonHCP", "LSC", "ELW", "SprayValet", "BosOpt"]
-
 # QuickBooks API Configuration
 QBO_AUTH_ENDPOINT = "https://appcenter.intuit.com/connect/oauth2"
 QBO_TOKEN_ENDPOINT = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
@@ -76,7 +73,6 @@ REPORT_BASIS = {
 # Config file paths (relative to project root)
 CONFIG_DIR = "config"
 SETTINGS_FILE = "settings.json"
-CLIENTS_FILE = "clients.json"
 SERVICE_ACCOUNT_FILE = "service_account.json"
 QBO_APP_FILE = "qbo_app.json"
 QBO_TOKENS_DIR = "qbo_tokens"

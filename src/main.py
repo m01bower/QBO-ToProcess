@@ -4,14 +4,12 @@ import sys
 import argparse
 from typing import Dict, List, Optional
 
-from config import CLIENTS
 from settings import (
     AppSettings,
     QBOAppSettings,
     ClientConfig,
     load_settings,
     save_qbo_app_settings,
-    save_clients,
     ensure_config_dir,
     get_service_account_path,
 )
@@ -100,42 +98,38 @@ def run_setup() -> bool:
     print("  2. Download JSON key as: config/service_account.json")
     print("  3. Share the spreadsheet with the service account email\n")
 
-    # Step 3: Client Configuration
+    # Step 3: Client Configuration (from MasterConfig)
     print("\n" + "-" * 40)
     print("Step 3: Client Configuration")
     print("-" * 40)
-    print(f"\nConfiguring {len(CLIENTS)} clients: {', '.join(CLIENTS)}\n")
 
+    # Get client list from MasterConfig (required)
+    from settings import get_master_config
+    try:
+        master = get_master_config()
+    except RuntimeError as e:
+        print(f"\nError: {e}")
+        return False
+    setup_clients = master.list_clients()
+    print(f"\nLoaded {len(setup_clients)} clients from MasterConfig")
+    print("(Client config — sheet IDs, auth methods, enabled flags — is managed in MasterConfig)\n")
+
+    # Build client configs from MasterConfig for the auth step
+    active_keys = master.get_active_clients("QBO", tool_feature="toprocess_active")
     clients: Dict[str, ClientConfig] = {}
-
-    for client_name in CLIENTS:
-        print(f"\n--- {client_name} ---")
-        sheet_id = get_input(f"  ToProcess Google Sheet ID (or skip): ").strip()
-
-        if not sheet_id:
-            print(f"  Skipping {client_name}")
-            clients[client_name] = ClientConfig(
-                name=client_name,
-                enabled=False,
-            )
-            continue
-
-        # Ask for Google auth method
-        auth_method = get_input(f"  Google auth method (oauth/service_account) [oauth]: ").strip().lower()
-        if auth_method not in ["oauth", "service_account", ""]:
-            print("  Invalid auth method, defaulting to oauth")
-            auth_method = "oauth"
-        auth_method = auth_method or "oauth"
-
-        clients[client_name] = ClientConfig(
-            name=client_name,
-            toprocess_sheet_id=sheet_id,
-            google_auth_method=auth_method,
-            enabled=True,
+    for client_key in setup_clients:
+        mc = master.get_client(client_key)
+        clients[client_key] = ClientConfig(
+            name=client_key,
+            qbo_realm_id=mc.qbo.realm_id,
+            toprocess_sheet_id=mc.sheets.toprocess_sheet_id,
+            google_auth_method=mc.qbo.google_auth_method or "oauth",
+            enabled=client_key in active_keys,
         )
-        print(f"  {client_name} configured ({auth_method})!")
 
-    save_clients(clients)
+    for name, cfg in clients.items():
+        status = "enabled" if cfg.enabled else "disabled"
+        print(f"  {name}: {status}")
 
     # Step 4: QBO OAuth per client
     print("\n" + "-" * 40)
@@ -161,8 +155,6 @@ def run_setup() -> bool:
                 config.qbo_realm_id = qbo._realm_id
         else:
             print(f"  ✗ {client_name} authorization failed")
-
-    save_clients(clients)
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
@@ -201,11 +193,6 @@ def authorize_client(client_name: str) -> bool:
     qbo = QBOService(settings.qbo_app, client_name)
     if qbo.authenticate_interactive():
         print(f"\n✓ {client_name} authorized successfully!")
-
-        # Update client config with realm_id
-        if qbo._realm_id:
-            settings.clients[client_name].qbo_realm_id = qbo._realm_id
-            save_clients(settings.clients)
 
         return True
     else:

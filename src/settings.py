@@ -1,9 +1,17 @@
 """Settings management for QBO ToProcess."""
 
 import json
+import sys
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional, Dict, List
+
+import keyring
+
+# Add _shared_config to sys.path so we can import config_reader
+_SHARED_CONFIG_DIR = Path(__file__).parent.parent.parent / "_shared_config"
+if str(_SHARED_CONFIG_DIR) not in sys.path:
+    sys.path.insert(0, str(_SHARED_CONFIG_DIR))
 
 
 @dataclass
@@ -50,17 +58,12 @@ def get_config_dir() -> Path:
 
 def get_shared_dir() -> Path:
     """Get the shared directory path for cross-project credentials."""
-    return Path("D:/Projects/_shared")
+    return Path(__file__).parent.parent.parent / "_shared_config"
 
 
 def get_settings_path() -> Path:
     """Get the settings.json file path."""
     return get_config_dir() / "settings.json"
-
-
-def get_clients_path() -> Path:
-    """Get the clients.json file path."""
-    return get_config_dir() / "clients.json"
 
 
 def get_service_account_path() -> Path:
@@ -80,49 +83,122 @@ def get_qbo_token_path(client_name: str) -> Path:
 
 def get_google_token_path(client_name: str) -> Path:
     """Get the Google OAuth token file path for a client (shared across projects)."""
-    return get_shared_dir() / "google_tokens" / f"{client_name.lower()}.json"
+    return get_shared_dir() / "clients" / client_name / "token.json"
 
 
-def get_google_credentials_path() -> Path:
-    """Get the Google OAuth credentials.json file path (shared across projects)."""
+def get_google_credentials_path(client_name: str = None) -> Path:
+    """
+    Get the Google OAuth credentials.json file path (shared across projects).
+
+    Checks for client-specific credentials first, falls back to shared default.
+    """
+    if client_name:
+        client_creds = get_shared_dir() / "clients" / client_name / "credentials.json"
+        if client_creds.exists():
+            return client_creds
     return get_shared_dir() / "credentials.json"
 
 
+def _load_master_config():
+    """
+    Load MasterConfig from the shared config reader.
+
+    Returns:
+        MasterConfig instance.
+
+    Raises:
+        RuntimeError: If MasterConfig cannot be loaded.
+    """
+    try:
+        from config_reader import MasterConfig
+        return MasterConfig()
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot load master config — check network and "
+            f"_shared_config/master_config.json: {e}"
+        ) from e
+
+
+# Module-level cache so we only read the master sheet once per run
+_master_config_cache = None
+
+
+def get_master_config():
+    """Get the cached MasterConfig instance (loads on first call)."""
+    global _master_config_cache
+    if _master_config_cache is None:
+        _master_config_cache = _load_master_config()
+    return _master_config_cache
+
+
 def load_settings() -> AppSettings:
-    """Load settings from config files."""
+    """
+    Load settings from MasterConfig (client data) and local files (secrets only).
+
+    QBO app credentials (client_id, client_secret) come from the OS keyring
+    (service "BosOpt"). Remaining QBO app settings (redirect_uri, environment)
+    come from local qbo_app.json. Client config (realm_id, sheet IDs, auth
+    method, enabled) comes exclusively from MasterConfig.
+
+    Raises:
+        RuntimeError: If MasterConfig cannot be loaded or client data cannot
+            be read from it.
+    """
     settings = AppSettings()
 
-    # Load QBO app settings
+    # Load QBO app settings:
+    #   client_id / client_secret  -> OS keyring (service "BosOpt")
+    #   redirect_uri / environment -> local qbo_app.json
+    client_id = keyring.get_password("BosOpt", "QBO-ClientID") or ""
+    client_secret = keyring.get_password("BosOpt", "QBO-ClientSecret") or ""
+    if not client_id or not client_secret:
+        print("Warning: QBO client_id/client_secret not found in keyring "
+              "(service='BosOpt', usernames='QBO-ClientID'/'QBO-ClientSecret')")
+
+    redirect_uri = "http://localhost:8080/callback"
+    environment = "production"
     qbo_app_path = get_qbo_app_path()
     if qbo_app_path.exists():
         try:
             with open(qbo_app_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                settings.qbo_app = QBOAppSettings(
-                    client_id=data.get("client_id", ""),
-                    client_secret=data.get("client_secret", ""),
-                    redirect_uri=data.get("redirect_uri", "http://localhost:8080/callback"),
-                    environment=data.get("environment", "production"),
-                )
+                redirect_uri = data.get("redirect_uri", redirect_uri)
+                environment = data.get("environment", environment)
         except (json.JSONDecodeError, IOError) as e:
-            print(f"Warning: Could not load QBO app settings: {e}")
+            print(f"Warning: Could not load QBO app settings from file: {e}")
 
-    # Load client configurations
-    clients_path = get_clients_path()
-    if clients_path.exists():
-        try:
-            with open(clients_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                for name, cfg in data.items():
-                    settings.clients[name] = ClientConfig(
-                        name=name,
-                        qbo_realm_id=cfg.get("qbo_realm_id", ""),
-                        toprocess_sheet_id=cfg.get("toprocess_sheet_id", ""),
-                        google_auth_method=cfg.get("google_auth_method", "oauth"),
-                        enabled=cfg.get("enabled", True),
-                    )
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Warning: Could not load client settings: {e}")
+    settings.qbo_app = QBOAppSettings(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=redirect_uri,
+        environment=environment,
+    )
+
+    # Load client config from MasterConfig (the only source of truth)
+    master = get_master_config()
+
+    # Get clients that have QBO ToProcess active
+    active_keys = master.get_active_clients("QBO", tool_feature="toprocess_active")
+
+    for client_key in master.list_clients():
+        mc = master.get_client(client_key)
+        # A client is "enabled" for this app if toprocess_active is set
+        is_enabled = client_key in active_keys
+
+        # Environment override: prefer master config, fall back to qbo_app.json
+        if mc.qbo.environment and mc.qbo.environment != "sandbox":
+            settings.qbo_app.environment = mc.qbo.environment
+
+        settings.clients[client_key] = ClientConfig(
+            name=client_key,
+            qbo_realm_id=mc.qbo.realm_id,
+            toprocess_sheet_id=mc.sheets.toprocess_sheet_id,
+            google_auth_method=mc.qbo.google_auth_method or "oauth",
+            enabled=is_enabled,
+        )
+
+    print(f"Loaded {len(settings.clients)} clients from MasterConfig "
+          f"({len(active_keys)} ToProcess-active)")
 
     return settings
 
@@ -134,24 +210,6 @@ def save_qbo_app_settings(qbo_app: QBOAppSettings) -> None:
 
     with open(get_qbo_app_path(), "w", encoding="utf-8") as f:
         json.dump(asdict(qbo_app), f, indent=2)
-
-
-def save_clients(clients: Dict[str, ClientConfig]) -> None:
-    """Save client configurations."""
-    config_dir = get_config_dir()
-    config_dir.mkdir(parents=True, exist_ok=True)
-
-    data = {}
-    for name, cfg in clients.items():
-        data[name] = {
-            "qbo_realm_id": cfg.qbo_realm_id,
-            "toprocess_sheet_id": cfg.toprocess_sheet_id,
-            "google_auth_method": cfg.google_auth_method,
-            "enabled": cfg.enabled,
-        }
-
-    with open(get_clients_path(), "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
 
 
 def save_qbo_token(client_name: str, token_data: dict) -> None:
@@ -179,10 +237,9 @@ def load_qbo_token(client_name: str) -> Optional[dict]:
 
 def save_google_token(client_name: str, token_data: dict) -> None:
     """Save Google OAuth token for a client (shared across projects)."""
-    token_dir = get_shared_dir() / "google_tokens"
-    token_dir.mkdir(parents=True, exist_ok=True)
-
     token_path = get_google_token_path(client_name)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+
     with open(token_path, "w", encoding="utf-8") as f:
         json.dump(token_data, f, indent=2)
 
@@ -205,5 +262,4 @@ def ensure_config_dir() -> Path:
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "qbo_tokens").mkdir(exist_ok=True)
-    (config_dir / "google_tokens").mkdir(exist_ok=True)
     return config_dir
