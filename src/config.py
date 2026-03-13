@@ -70,8 +70,7 @@ REPORT_BASIS = {
     "Accrual": "Accrual",
 }
 
-# Config file paths (relative to project root)
-CONFIG_DIR = "config"
+# Settings file names (stored in _shared_config/apps/QBO_ToProcess/)
 SETTINGS_FILE = "settings.json"
 SERVICE_ACCOUNT_FILE = "service_account.json"
 QBO_APP_FILE = "qbo_app.json"

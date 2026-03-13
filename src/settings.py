@@ -49,36 +49,37 @@ class AppSettings:
         return [name for name, cfg in self.clients.items() if cfg.enabled]
 
 
+_SHARED_APP_DIR = _SHARED_CONFIG_DIR / "apps" / "QBO_ToProcess"
+
+
 def get_config_dir() -> Path:
-    """Get the config directory path."""
-    src_dir = Path(__file__).parent
-    project_root = src_dir.parent
-    return project_root / "config"
+    """Get the app config directory in _shared_config."""
+    return _SHARED_APP_DIR
 
 
 def get_shared_dir() -> Path:
     """Get the shared directory path for cross-project credentials."""
-    return Path(__file__).parent.parent.parent / "_shared_config"
+    return _SHARED_CONFIG_DIR
 
 
 def get_settings_path() -> Path:
     """Get the settings.json file path."""
-    return get_config_dir() / "settings.json"
+    return _SHARED_APP_DIR / "settings.json"
 
 
 def get_service_account_path() -> Path:
     """Get the service_account.json file path."""
-    return get_config_dir() / "service_account.json"
+    return _SHARED_APP_DIR / "service_account.json"
 
 
 def get_qbo_app_path() -> Path:
     """Get the qbo_app.json file path."""
-    return get_config_dir() / "qbo_app.json"
+    return _SHARED_APP_DIR / "qbo_app.json"
 
 
 def get_qbo_token_path(client_name: str) -> Path:
     """Get the QBO token file path for a client."""
-    return get_config_dir() / "qbo_tokens" / f"{client_name.lower()}.json"
+    return _SHARED_APP_DIR / "qbo_tokens" / f"{client_name.lower()}.json"
 
 
 def get_google_token_path(client_name: str) -> Path:
@@ -149,12 +150,6 @@ def load_settings() -> AppSettings:
     # Load QBO app settings:
     #   client_id / client_secret  -> OS keyring (service "BosOpt")
     #   redirect_uri / environment -> local qbo_app.json
-    client_id = keyring.get_password("BosOpt", "QBO-ClientID") or ""
-    client_secret = keyring.get_password("BosOpt", "QBO-ClientSecret") or ""
-    if not client_id or not client_secret:
-        print("Warning: QBO client_id/client_secret not found in keyring "
-              "(service='BosOpt', usernames='QBO-ClientID'/'QBO-ClientSecret')")
-
     redirect_uri = "http://localhost:8080/callback"
     environment = "production"
     qbo_app_path = get_qbo_app_path()
@@ -166,6 +161,18 @@ def load_settings() -> AppSettings:
                 environment = data.get("environment", environment)
         except (json.JSONDecodeError, IOError) as e:
             print(f"Warning: Could not load QBO app settings from file: {e}")
+
+    # Pick sandbox or production keys from keyring based on environment
+    is_sandbox = environment.lower() == "sandbox"
+    client_id = keyring.get_password(
+        "BosOpt", "QBO-Sandbox-ClientID" if is_sandbox else "QBO-ClientID"
+    ) or ""
+    client_secret = keyring.get_password(
+        "BosOpt", "QBO-Sandbox-ClientSecret" if is_sandbox else "QBO-ClientSecret"
+    ) or ""
+    if not client_id or not client_secret:
+        env_label = "Sandbox" if is_sandbox else "Production"
+        print(f"Warning: QBO {env_label} client_id/client_secret not found in keyring")
 
     settings.qbo_app = QBOAppSettings(
         client_id=client_id,
@@ -205,8 +212,7 @@ def load_settings() -> AppSettings:
 
 def save_qbo_app_settings(qbo_app: QBOAppSettings) -> None:
     """Save QBO app settings."""
-    config_dir = get_config_dir()
-    config_dir.mkdir(parents=True, exist_ok=True)
+    _SHARED_APP_DIR.mkdir(parents=True, exist_ok=True)
 
     with open(get_qbo_app_path(), "w", encoding="utf-8") as f:
         json.dump(asdict(qbo_app), f, indent=2)
@@ -214,7 +220,7 @@ def save_qbo_app_settings(qbo_app: QBOAppSettings) -> None:
 
 def save_qbo_token(client_name: str, token_data: dict) -> None:
     """Save QBO OAuth token for a client."""
-    token_dir = get_config_dir() / "qbo_tokens"
+    token_dir = _SHARED_APP_DIR / "qbo_tokens"
     token_dir.mkdir(parents=True, exist_ok=True)
 
     token_path = get_qbo_token_path(client_name)
@@ -258,8 +264,7 @@ def load_google_token(client_name: str) -> Optional[dict]:
 
 
 def ensure_config_dir() -> Path:
-    """Ensure the config directory exists and return its path."""
-    config_dir = get_config_dir()
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "qbo_tokens").mkdir(exist_ok=True)
-    return config_dir
+    """Ensure the app config directory exists and return its path."""
+    _SHARED_APP_DIR.mkdir(parents=True, exist_ok=True)
+    (_SHARED_APP_DIR / "qbo_tokens").mkdir(exist_ok=True)
+    return _SHARED_APP_DIR
