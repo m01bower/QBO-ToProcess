@@ -17,7 +17,7 @@ from logger_setup import setup_logger, get_logger
 from services.qbo_service import QBOService
 from services.sheets_service import SheetsService
 from processors.report_processor import ReportProcessor
-from gui.client_selector import select_clients
+from processors.preflight import run_preflight
 
 
 def run_setup() -> bool:
@@ -149,12 +149,12 @@ def run_setup() -> bool:
 
         qbo = QBOService(qbo_app, client_name)
         if qbo.authenticate_interactive():
-            print(f"  ✓ {client_name} authorized!")
+            print(f"  \u2713 {client_name} authorized!")
             # Update realm_id in client config
             if qbo._realm_id:
                 config.qbo_realm_id = qbo._realm_id
         else:
-            print(f"  ✗ {client_name} authorization failed")
+            print(f"  \u2717 {client_name} authorization failed")
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
@@ -192,112 +192,127 @@ def authorize_client(client_name: str) -> bool:
 
     qbo = QBOService(settings.qbo_app, client_name)
     if qbo.authenticate_interactive():
-        print(f"\n✓ {client_name} authorized successfully!")
+        print(f"\n\u2713 {client_name} authorized successfully!")
 
         return True
     else:
-        print(f"\n✗ {client_name} authorization failed")
+        print(f"\n\u2717 {client_name} authorization failed")
         return False
 
 
-def process_clients(client_names: List[str]) -> int:
+def process_client(client_name: str, settings: AppSettings,
+                   sheet_override: Optional[str] = None) -> int:
     """
-    Process reports for specified clients.
+    Process reports for a single client using preflight + two-phase approach.
 
     Args:
-        client_names: List of client names to process
+        client_name: Client name to process
+        settings: Loaded app settings
+        sheet_override: Optional override for the ToProcess sheet ID (for testing)
 
     Returns:
         Exit code (0 for success)
     """
     logger = get_logger()
-    settings = load_settings()
 
-    if not settings.is_configured():
-        logger.error("App not configured. Run --setup first.")
+    if client_name not in settings.clients:
+        logger.error(f"Unknown client: {client_name}")
+        print(f"Available clients: {', '.join(settings.clients.keys())}")
         return 1
 
-    all_results = {}
-    error_count = 0
+    client_config = settings.clients[client_name]
 
-    for client_name in client_names:
-        if client_name not in settings.clients:
-            logger.error(f"Unknown client: {client_name}")
-            continue
+    if not client_config.enabled and not sheet_override:
+        logger.warning(f"Client {client_name} is disabled in MasterConfig")
+        return 1
 
-        client_config = settings.clients[client_name]
+    toprocess_sheet_id = sheet_override or client_config.toprocess_sheet_id
+    if not toprocess_sheet_id:
+        logger.error(f"No ToProcess sheet ID for {client_name}")
+        return 1
 
-        if not client_config.enabled:
-            logger.warning(f"Client {client_name} is disabled, skipping")
-            continue
+    if sheet_override:
+        logger.info(f"Using sheet override: {sheet_override}")
 
-        if not client_config.toprocess_sheet_id:
-            logger.error(f"No ToProcess sheet ID for {client_name}")
-            continue
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"Client: {client_name}")
+    logger.info(f"ToProcess Sheet: {toprocess_sheet_id}")
+    logger.info(f"{'=' * 60}")
 
-        logger.info(f"\n{'=' * 40}")
-        logger.info(f"Processing: {client_name}")
-        logger.info(f"{'=' * 40}")
+    # Initialize Google Sheets service (always use BosOpt credentials for Sheets)
+    sheets = SheetsService(
+        auth_method=client_config.google_auth_method,
+        client_name="BosOpt",
+    )
+    if not sheets.authenticate():
+        logger.error(f"Failed to authenticate with Google Sheets for {client_name}")
+        return 1
 
-        # Initialize Sheets service with client's auth method
-        sheets = SheetsService(
-            auth_method=client_config.google_auth_method,
-            client_name=client_name,
-        )
-        if not sheets.authenticate():
-            logger.error(f"  Failed to authenticate with Google Sheets for {client_name}")
-            error_count += 1
-            continue
+    # Initialize QBO service
+    qbo = QBOService(settings.qbo_app, client_name)
 
-        # Initialize QBO service for this client
-        qbo = QBOService(settings.qbo_app, client_name)
+    if not qbo.is_authenticated:
+        logger.error(f"{client_name} not authorized. Run: --auth {client_name}")
+        return 1
 
-        if not qbo.is_authenticated:
-            logger.error(f"  {client_name} not authorized. Run: --auth {client_name}")
-            error_count += 1
-            continue
+    # ── Pre-flight checks ──
+    preflight_result, configs = run_preflight(qbo, sheets, toprocess_sheet_id)
 
-        if not qbo.test_connection():
-            logger.error(f"  Failed to connect to QBO for {client_name}")
-            error_count += 1
-            continue
+    if not preflight_result.all_passed:
+        logger.error("\nPre-flight checks FAILED:")
+        for failure in preflight_result.failures:
+            logger.error(f"  \u2717 {failure['name']}: {failure['detail']}")
+        logger.error("\nAborting. Fix the issues above and try again.")
+        return 1
 
-        # Verify sheet access
-        if not sheets.verify_sheet_access(client_config.toprocess_sheet_id):
-            logger.error(f"  Cannot access ToProcess sheet for {client_name}")
-            error_count += 1
-            continue
+    # Retrieve year from configs (preflight already read it)
+    # Re-read just the year since preflight validated it exists
+    year_val, _ = sheets.read_toprocess_config(toprocess_sheet_id)
+    if year_val is None:
+        logger.error("Could not determine report year")
+        return 1
 
-        # Process reports
-        processor = ReportProcessor(qbo, sheets)
-        results = processor.process_all_reports(client_config.toprocess_sheet_id)
-
-        all_results[client_name] = results
-
-        # Count errors for this client
-        client_errors = sum(1 for r in results.values() if r.get("status") == "error")
-        if client_errors > 0:
-            error_count += client_errors
+    # ── Two-phase processing ──
+    processor = ReportProcessor(qbo, sheets)
+    results = processor.process_all_reports(
+        toprocess_sheet_id,
+        configs=configs,
+        year=year_val,
+    )
 
     # Print summary
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
+    print(f"\n{'=' * 60}")
+    print(f"SUMMARY — {client_name}")
+    print(f"{'=' * 60}")
 
-    for client_name, results in all_results.items():
-        success = sum(1 for r in results.values() if r.get("status") == "success")
-        errors = sum(1 for r in results.values() if r.get("status") == "error")
-        print(f"\n{client_name}: {success} succeeded, {errors} failed")
+    # Separate row-change flags from report results
+    row_changes = {k: v for k, v in results.items() if k.startswith("_row_change_")}
+    report_results = {k: v for k, v in results.items() if not k.startswith("_row_change_")}
 
-        for report, result in results.items():
-            status = result.get("status", "unknown")
-            rows = result.get("rows", 0)
-            error = result.get("error", "")
+    success_count = sum(1 for r in report_results.values() if r.get("status") == "success")
+    error_count = sum(1 for r in report_results.values() if r.get("status") == "error")
 
-            if status == "success":
-                print(f"  ✓ {report}: {rows} rows")
-            else:
-                print(f"  ✗ {report}: {error}")
+    print(f"\n{success_count} succeeded, {error_count} failed\n")
+
+    for report, result in report_results.items():
+        status = result.get("status", "unknown")
+        rows = result.get("rows", 0)
+        error = result.get("error", "")
+
+        if status == "success":
+            print(f"  \u2713 {report}: {rows} rows")
+        else:
+            print(f"  \u2717 {report}: {error}")
+
+    # Alert on row changes that may require manual verification
+    if row_changes:
+        print(f"\n{'!' * 60}")
+        print("ROW CHANGES DETECTED — verify dependent tabs:")
+        print(f"{'!' * 60}")
+        for change_key, info in row_changes.items():
+            tab = info.get("tab", "")
+            added = info.get("rows_added", 0)
+            print(f"  \u26a0 {tab}: {added} row(s) inserted — check formulas in other tabs")
 
     return 0 if error_count == 0 else 1
 
@@ -320,13 +335,19 @@ def main():
     parser.add_argument(
         "--client",
         metavar="CLIENT",
-        action="append",
-        help="Process specific client(s) - can be used multiple times",
+        required=False,
+        help="Client to process",
     )
     parser.add_argument(
-        "--all",
+        "--sheet",
+        metavar="SHEET_ID",
+        required=False,
+        help="Override the ToProcess sheet ID (for testing with a sandbox sheet)",
+    )
+    parser.add_argument(
+        "--test",
         action="store_true",
-        help="Process all enabled clients without GUI",
+        help="Use the test_toprocess_sheet_id from qbo_app.json config",
     )
 
     args = parser.parse_args()
@@ -352,38 +373,22 @@ def main():
         print("  python src/main.py --setup")
         sys.exit(1)
 
-    # Determine which clients to process
-    if args.client:
-        # Specific clients from command line
-        clients_to_process = args.client
-    elif args.all:
-        # All enabled clients
-        clients_to_process = settings.get_enabled_clients()
-        if not clients_to_process:
-            print("No enabled clients found. Run --setup to configure.")
+    # Determine client
+    if not args.client:
+        print("Error: --client is required. Specify which client to process.")
+        print(f"Available clients: {', '.join(settings.get_enabled_clients())}")
+        sys.exit(1)
+
+    # Determine sheet override
+    sheet_override = args.sheet
+    if args.test:
+        if not settings.test_toprocess_sheet_id:
+            print("Error: --test flag used but no test_toprocess_sheet_id in qbo_app.json")
             sys.exit(1)
-    else:
-        # Show GUI for selection
-        enabled_clients = settings.get_enabled_clients()
-        if not enabled_clients:
-            print("No enabled clients found. Run --setup to configure.")
-            sys.exit(1)
+        sheet_override = settings.test_toprocess_sheet_id
+        print(f"TEST MODE: Using test sheet {sheet_override}")
 
-        client_status = {
-            name: cfg.enabled
-            for name, cfg in settings.clients.items()
-        }
-
-        selected = select_clients(enabled_clients, client_status)
-
-        if not selected:
-            print("Operation cancelled")
-            sys.exit(0)
-
-        clients_to_process = selected
-
-    # Process the selected clients
-    exit_code = process_clients(clients_to_process)
+    exit_code = process_client(args.client, settings, sheet_override=sheet_override)
     sys.exit(exit_code)
 
 

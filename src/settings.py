@@ -39,6 +39,7 @@ class AppSettings:
     qbo_app: QBOAppSettings = field(default_factory=QBOAppSettings)
     clients: Dict[str, ClientConfig] = field(default_factory=dict)
     use_service_account: bool = True
+    test_toprocess_sheet_id: str = ""
 
     def is_configured(self) -> bool:
         """Check if basic settings are present."""
@@ -152,6 +153,7 @@ def load_settings() -> AppSettings:
     #   redirect_uri / environment -> local qbo_app.json
     redirect_uri = "http://localhost:8080/callback"
     environment = "production"
+    test_toprocess_sheet_id = ""
     qbo_app_path = get_qbo_app_path()
     if qbo_app_path.exists():
         try:
@@ -159,6 +161,7 @@ def load_settings() -> AppSettings:
                 data = json.load(f)
                 redirect_uri = data.get("redirect_uri", redirect_uri)
                 environment = data.get("environment", environment)
+                test_toprocess_sheet_id = data.get("test_toprocess_sheet_id", "")
         except (json.JSONDecodeError, IOError) as e:
             print(f"Warning: Could not load QBO app settings from file: {e}")
 
@@ -180,6 +183,7 @@ def load_settings() -> AppSettings:
         redirect_uri=redirect_uri,
         environment=environment,
     )
+    settings.test_toprocess_sheet_id = test_toprocess_sheet_id
 
     # Load client config from MasterConfig (the only source of truth)
     master = get_master_config()

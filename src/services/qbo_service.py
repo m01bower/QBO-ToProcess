@@ -62,6 +62,72 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _TokenReceiverHandler(BaseHTTPRequestHandler):
+    """HTTP handler to receive auth code redirected from the server callback.
+
+    The server at bosoptimization.com/qbo/callback redirects here with the
+    auth code and realmId. This handler exchanges the code for tokens locally.
+    """
+
+    def do_GET(self):
+        """Handle GET request with auth code from server redirect."""
+        query = parse_qs(urlparse(self.path).query)
+
+        if "code" in query:
+            code = query["code"][0]
+            realm_id = query.get("realmId", [""])[0]
+
+            # Exchange code for tokens locally
+            try:
+                auth = HTTPBasicAuth(
+                    self.server.app_settings.client_id,
+                    self.server.app_settings.client_secret,
+                )
+                response = requests.post(
+                    QBO_TOKEN_ENDPOINT,
+                    auth=auth,
+                    data={
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": self.server.app_settings.redirect_uri,
+                    },
+                    headers={"Accept": "application/json"},
+                )
+                response.raise_for_status()
+                token_data = response.json()
+                token_data["obtained_at"] = time.time()
+                token_data["realm_id"] = realm_id
+
+                self.server.token_data = token_data
+                self.send_response(200)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    f"<html><body><h1>Authorization successful!</h1>"
+                    f"<p>Company ID: {realm_id}</p>"
+                    f"<p>You can close this window.</p></body></html>".encode()
+                )
+            except Exception as e:
+                self.server.error = str(e)
+                self.send_response(500)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    f"<html><body><h1>Token exchange failed</h1>"
+                    f"<p>{e}</p></body></html>".encode()
+                )
+        else:
+            self.server.error = "No auth code received"
+            self.send_response(400)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body><h1>Authorization failed</h1></body></html>")
+
+    def log_message(self, format, *args):
+        """Suppress HTTP server logging."""
+        pass
+
+
 class QBOService:
     """Service for interacting with QuickBooks Online API."""
 
@@ -115,56 +181,96 @@ class QBOService:
             "response_type": "code",
             "scope": " ".join(QBO_SCOPES),
             "redirect_uri": self.app_settings.redirect_uri,
-            "state": f"{self.client_name}_{int(time.time())}",
+            "state": f"{self.client_name}_QBO_ToProcess_{int(time.time())}",
         }
         return f"{QBO_AUTH_ENDPOINT}?{urlencode(params)}"
 
     def authenticate_interactive(self) -> bool:
         """
-        Run interactive OAuth flow with local callback server.
+        Run interactive OAuth flow.
+
+        For server-based redirect URIs (https://), opens the browser and
+        polls for the token file to appear (written by the server callback).
+        For localhost redirect URIs, runs a local callback server.
 
         Returns:
             True if authentication successful
         """
         try:
-            # Parse redirect URI to get port
-            parsed = urlparse(self.app_settings.redirect_uri)
-            port = parsed.port or 8080
+            redirect_uri = self.app_settings.redirect_uri
+            is_localhost = "localhost" in redirect_uri or "127.0.0.1" in redirect_uri
 
-            # Start local server for callback
-            server = HTTPServer(("localhost", port), OAuthCallbackHandler)
-            server.auth_code = None
-            server.realm_id = None
-            server.error = None
-
-            # Open browser for authorization
             auth_url = self.get_authorization_url()
             logger.info(f"Opening browser for {self.client_name} authorization...")
             webbrowser.open(auth_url)
 
-            print(f"\nAuthorize {self.client_name} in the browser...")
-            print("Waiting for callback...")
-
-            # Wait for callback (with timeout)
-            server.timeout = 120
-            while server.auth_code is None and server.error is None:
-                server.handle_request()
-
-            if server.auth_code:
-                # Exchange code for tokens
-                success = self._exchange_code(server.auth_code, server.realm_id)
-                if success:
-                    logger.info(f"Successfully authenticated {self.client_name}")
-                    return True
-
-            if server.error:
-                logger.error(f"OAuth error for {self.client_name}: {server.error}")
-
-            return False
+            if is_localhost:
+                return self._auth_local_callback(redirect_uri)
+            else:
+                return self._auth_poll_for_token()
 
         except Exception as e:
             logger.error(f"Authentication failed for {self.client_name}: {e}")
             return False
+
+    def _auth_local_callback(self, redirect_uri: str) -> bool:
+        """Auth flow using local HTTP callback server."""
+        parsed = urlparse(redirect_uri)
+        port = parsed.port or 8080
+
+        server = HTTPServer(("localhost", port), OAuthCallbackHandler)
+        server.auth_code = None
+        server.realm_id = None
+        server.error = None
+
+        print(f"\nAuthorize {self.client_name} in the browser...")
+        print("Waiting for callback...")
+
+        server.timeout = 120
+        while server.auth_code is None and server.error is None:
+            server.handle_request()
+
+        if server.auth_code:
+            success = self._exchange_code(server.auth_code, server.realm_id)
+            if success:
+                logger.info(f"Successfully authenticated {self.client_name}")
+                return True
+
+        if server.error:
+            logger.error(f"OAuth error for {self.client_name}: {server.error}")
+
+        return False
+
+    def _auth_poll_for_token(self) -> bool:
+        """Auth flow for server-based callbacks.
+
+        Runs a local HTTP server on port 8080 to receive the auth code
+        redirected from the ProjectKickoff server callback. The local
+        handler exchanges the code for tokens using local keyring credentials.
+        """
+        print(f"\nAuthorize {self.client_name} in the browser...")
+        print("Waiting for authorization...")
+
+        server = HTTPServer(("localhost", 8080), _TokenReceiverHandler)
+        server.token_data = None
+        server.error = None
+        server.app_settings = self.app_settings
+
+        server.timeout = 120
+        while server.token_data is None and server.error is None:
+            server.handle_request()
+
+        if server.token_data:
+            self._token_data = server.token_data
+            self._realm_id = server.token_data.get("realm_id")
+            self._save_token()
+            logger.info(f"Successfully authenticated {self.client_name}")
+            return True
+
+        if server.error:
+            logger.error(f"OAuth error for {self.client_name}: {server.error}")
+
+        return False
 
     def _exchange_code(self, code: str, realm_id: Optional[str]) -> bool:
         """Exchange authorization code for tokens."""
@@ -350,12 +456,12 @@ class QBOService:
 
         # Handle date_range overrides
         if date_range.upper() == "ALL":
-            start_date = "2000-01-01"
-            # End at year-end, or today if current year
-            if year >= today.year:
-                end_date = today.isoformat()
-            else:
-                end_date = f"{year}-12-31"
+            # Let QBO determine the full date range (no years of zeros)
+            start_date = None
+            end_date = None
+        elif date_range.upper() == "LAST":
+            start_date = f"{year - 1}-01-01"
+            end_date = f"{year - 1}-12-31"
         else:
             start_date = f"{year}-01-01"
             end_date = f"{year}-12-31"
@@ -364,51 +470,52 @@ class QBOService:
         if "Comparison" in special_options:
             start_date = f"{year - 1}-01-01"
 
-        # Cap end date at today if in current year (unless full_year requested)
-        if not full_year and year == today.year and date_range.upper() != "ALL":
+        # Cap end date at today if in current year (unless full_year or ALL)
+        if not full_year and year == today.year and start_date is not None:
             end_date = today.isoformat()
 
-        if qbo_report in ["BalanceSheet"]:
-            # Balance Sheet uses as_of date for point-in-time, but for comparison we use date range
-            if full_year:
-                # Use explicit date range to get all months in the year
-                params["start_date"] = start_date
-                params["end_date"] = end_date
-                if display.lower() in ["monthly", "months"]:
-                    params["summarize_column_by"] = "Month"
-                elif display.lower() in ["weekly", "weeks"]:
-                    params["summarize_column_by"] = "Week"
-            elif display.lower() in ["monthly", "months"]:
-                params["date_macro"] = "This Fiscal Year-to-date"
-                params["summarize_column_by"] = "Month"
-            elif display.lower() in ["weekly", "weeks"]:
-                params["date_macro"] = "This Fiscal Year-to-date"
-                params["summarize_column_by"] = "Week"
-            else:
-                params["start_date"] = start_date
-                params["end_date"] = end_date
-        elif qbo_report in ["ProfitAndLoss", "CustomerSales", "ItemSales"]:
+        # Set date params: use date_macro for ALL, explicit dates otherwise
+        use_all_dates = start_date is None  # date_range == ALL
+        if use_all_dates:
+            params["date_macro"] = "All"
+        else:
             params["start_date"] = start_date
             params["end_date"] = end_date
 
-            if display.lower() in ["monthly", "months"]:
+        if qbo_report in ["BalanceSheet"]:
+            if not use_all_dates and not full_year:
+                # Override with fiscal YTD macro for Balance Sheet
+                if display.lower() in ["month", "monthly", "months"]:
+                    params.pop("start_date", None)
+                    params.pop("end_date", None)
+                    params["date_macro"] = "This Fiscal Year-to-date"
+
+            if display.lower() in ["month", "monthly", "months"]:
                 params["summarize_column_by"] = "Month"
-            elif display.lower() in ["quarterly", "quarters"]:
+            elif display.lower() in ["week", "weekly", "weeks"]:
+                params["summarize_column_by"] = "Week"
+        elif qbo_report in ["ProfitAndLoss", "CustomerSales", "ItemSales"]:
+            if display.lower() in ["month", "monthly", "months"]:
+                params["summarize_column_by"] = "Month"
+            elif display.lower() in ["quarter", "quarterly", "quarters"]:
                 params["summarize_column_by"] = "Quarter"
-            elif display.lower() in ["yearly", "years", "year"]:
+            elif display.lower() in ["year", "yearly", "years"]:
                 params["summarize_column_by"] = "Year"
-            elif display.lower() in ["weekly", "weeks"]:
+            elif display.lower() in ["week", "weekly", "weeks"]:
                 params["summarize_column_by"] = "Week"
             elif display.lower() == "total":
                 params["summarize_column_by"] = "Total"
         elif qbo_report in ["AgedReceivables", "AgedReceivablesSummary"]:
             # AR reports use as_of date
             params["report_date"] = today.isoformat()
-            if display.lower() == "biweekly":
-                params["aging_period"] = "14"
-            else:
-                params["aging_period"] = "15"
-            params["num_periods"] = "6"
+            # Column M = aging period in days (e.g. "7", "15", "30")
+            # Extract numeric value, default to 15
+            import re
+            period_match = re.search(r"\d+", display)
+            aging_days = int(period_match.group()) if period_match else 15
+            params["aging_period"] = str(aging_days)
+            # Scale num_periods to cover ~90 days regardless of period size
+            params["num_periods"] = str(max(4, min(12, 90 // aging_days)))
 
         # Accounting basis
         if basis.lower() in ["cash", "accrual"]:
@@ -446,7 +553,7 @@ class QBOService:
         # Extract columns (headers)
         columns = report_data.get("Columns", {}).get("Column", [])
         for col in columns:
-            col_title = col.get("ColTitle", "")
+            col_title = col.get("ColTitle", "").strip()
             headers.append(col_title)
 
         # Extract rows
@@ -463,7 +570,7 @@ class QBOService:
             # Check for TOTAL in row (for -T handling)
             is_total_row = False
             if col_data:
-                first_col_value = col_data[0].get("value", "") if col_data else ""
+                first_col_value = col_data[0].get("value", "").strip() if col_data else ""
                 if "total" in first_col_value.lower():
                     is_total_row = True
 
@@ -473,12 +580,12 @@ class QBOService:
 
             # Process header row if present
             if header and header.get("ColData"):
-                header_row = [c.get("value", "") for c in header.get("ColData", [])]
+                header_row = [c.get("value", "").strip() for c in header.get("ColData", [])]
                 result.append(header_row)
 
             # Process this row's data
             if col_data:
-                row_values = [c.get("value", "") for c in col_data]
+                row_values = [c.get("value", "").strip() for c in col_data]
                 result.append(row_values)
 
             # Handle T: stop at TOTAL (include the total row but stop after)
@@ -493,7 +600,7 @@ class QBOService:
 
             # Process summary row if present
             if summary and summary.get("ColData"):
-                summary_row = [c.get("value", "") for c in summary.get("ColData", [])]
+                summary_row = [c.get("value", "").strip() for c in summary.get("ColData", [])]
 
                 # Check if summary is a TOTAL
                 if summary_row and "total" in str(summary_row[0]).lower():
@@ -825,3 +932,105 @@ class QBOService:
         if col_data:
             return col_data[0].get("value", "")
         return ""
+
+    # ---- Customer / Item methods for Sales reports ----
+
+    def get_customers(self) -> List[Dict[str, Any]]:
+        """Fetch all active customers."""
+        result = self._make_request("GET", "query", {
+            "query": "SELECT * FROM Customer WHERE Active = true",
+            "minorversion": "75",
+        })
+        if not result or "QueryResponse" not in result:
+            logger.error("Failed to fetch customers")
+            return []
+        return result["QueryResponse"].get("Customer", [])
+
+    def get_items(self) -> List[Dict[str, Any]]:
+        """Fetch all active products/services (items)."""
+        result = self._make_request("GET", "query", {
+            "query": "SELECT * FROM Item WHERE Active = true",
+            "minorversion": "75",
+        })
+        if not result or "QueryResponse" not in result:
+            logger.error("Failed to fetch items")
+            return []
+        return result["QueryResponse"].get("Item", [])
+
+    def inject_missing_entities(
+        self,
+        report_data: Dict[str, Any],
+        entities: List[Dict[str, Any]],
+        name_field: str = "DisplayName",
+    ) -> Dict[str, Any]:
+        """
+        Inject zero-value rows for customers/items not present in a Sales report.
+
+        Sales reports have a flat list of rows (no nested sections), so this
+        is simpler than COA injection.
+
+        Args:
+            report_data: Raw report data from QBO API (modified in-place)
+            entities: List of customer or item dicts
+            name_field: Field name for the display name (DisplayName for
+                        customers, Name for items)
+
+        Returns:
+            The modified report_data
+        """
+        if not report_data or not entities:
+            return report_data
+
+        num_cols = len(report_data.get("Columns", {}).get("Column", []))
+        if num_cols == 0:
+            return report_data
+
+        top_rows = report_data.get("Rows", {}).get("Row", [])
+
+        # Collect names already in the report (exclude TOTAL/GrandTotal)
+        present_names = set()
+        for row in top_rows:
+            name = self._get_row_name(row)
+            group = row.get("group", "")
+            if name and group != "GrandTotal" and "total" not in name.lower():
+                present_names.add(name.strip())
+
+        # Find the data rows list (before GrandTotal)
+        # GrandTotal section is typically the last row
+        data_rows = []
+        grand_total_idx = None
+        for i, row in enumerate(top_rows):
+            if row.get("group") == "GrandTotal":
+                grand_total_idx = i
+                break
+            data_rows.append(row)
+
+        # Inject missing entities
+        injected = 0
+        for entity in sorted(entities, key=lambda e: e.get(name_field, "")):
+            name = entity.get(name_field, "").strip()
+            if not name or name in present_names:
+                continue
+
+            # Skip sub-customers (they have a Parent ref)
+            if entity.get("ParentRef"):
+                continue
+
+            new_row = {
+                "ColData": self._make_zero_coldata(name, "", num_cols),
+                "type": "Data",
+            }
+            self._insert_sorted(data_rows, new_row, name)
+            injected += 1
+
+        # Rebuild top_rows with data + GrandTotal
+        if grand_total_idx is not None:
+            report_data["Rows"]["Row"] = data_rows + [top_rows[grand_total_idx]]
+        else:
+            report_data["Rows"]["Row"] = data_rows
+
+        if injected:
+            logger.info(f"Injected {injected} missing entities "
+                        f"({len(present_names)} present, "
+                        f"{len(entities)} total)")
+        return report_data

@@ -167,7 +167,7 @@ class SheetsService:
             # Get all data from row 2 onwards (row 1 is headers)
             data_result = self.sheets.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-                range=f"'{TOPROCESS_TAB_NAME}'!A2:P100",
+                range=f"'{TOPROCESS_TAB_NAME}'!A2:Q100",
             ).execute()
 
             rows = data_result.get("values", [])
@@ -175,7 +175,7 @@ class SheetsService:
             # Also get headers
             header_result = self.sheets.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-                range=f"'{TOPROCESS_TAB_NAME}'!A1:P1",
+                range=f"'{TOPROCESS_TAB_NAME}'!A1:Q1",
             ).execute()
             headers = header_result.get("values", [[]])[0]
 
@@ -191,7 +191,9 @@ class SheetsService:
                 "K": 10,  # Processed Date
                 "L": 11,  # QBO Report
                 "M": 12,  # Report Display
-                "N": 13,  # Report Basis
+                "N": 13,  # Date Range
+                "O": 14,  # Report Basis
+                "P": 15,  # Move (New) Tab to Index
             }
 
             configs = []
@@ -220,7 +222,9 @@ class SheetsService:
                     "new_tab_name_format": get_val("J"),
                     "qbo_report": qbo_report,
                     "report_display": get_val("M", "Monthly"),
-                    "report_basis": get_val("N", "Accrual"),
+                    "date_range": get_val("N", "This Year"),
+                    "report_basis": get_val("O", "Accrual"),
+                    "tab_index": get_val("P", ""),
                 }
                 configs.append(config)
 
@@ -366,22 +370,47 @@ class SheetsService:
         except HttpError:
             return None
 
+    def delete_tab(self, spreadsheet_id: str, tab_name: str) -> bool:
+        """Delete a tab from a spreadsheet."""
+        try:
+            sheet_id = self.get_tab_id(spreadsheet_id, tab_name)
+            if sheet_id is None:
+                return True  # Already gone
+
+            self.sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [{
+                    "deleteSheet": {"sheetId": sheet_id}
+                }]},
+            ).execute()
+            logger.info(f"Deleted tab: {tab_name}")
+            return True
+        except HttpError as e:
+            logger.error(f"Failed to delete tab {tab_name}: {e}")
+            return False
+
     def duplicate_tab(
         self,
         spreadsheet_id: str,
         source_tab_name: str,
         new_tab_name: str,
+        tab_index: Optional[int] = None,
     ) -> bool:
         """
         Duplicate a tab with a new name.
+
+        If the destination tab already exists, it is deleted first and
+        recreated fresh from the template. This ensures clean formatting
+        and avoids stale data (e.g. extra TOTAL rows from prior runs).
 
         Args:
             spreadsheet_id: Google Sheet ID
             source_tab_name: Name of tab to duplicate
             new_tab_name: Name for the new tab
+            tab_index: Position to place the new tab (0-based). If None, no move.
 
         Returns:
-            True if successful
+            True if successful (tab exists and is ready for data)
         """
         try:
             source_id = self.get_tab_id(spreadsheet_id, source_tab_name)
@@ -389,25 +418,46 @@ class SheetsService:
                 logger.error(f"Source tab not found: {source_tab_name}")
                 return False
 
-            # Check if destination already exists
-            if self.get_tab_id(spreadsheet_id, new_tab_name) is not None:
-                logger.info(f"Tab already exists: {new_tab_name}")
-                return True
+            # Delete existing tab if present
+            existing_id = self.get_tab_id(spreadsheet_id, new_tab_name)
+            if existing_id is not None:
+                logger.info(f"Deleting existing tab: {new_tab_name}")
+                if not self.delete_tab(spreadsheet_id, new_tab_name):
+                    return False
 
-            # Duplicate the sheet
-            request = {
+            # Duplicate from template
+            dup_request = {
                 "duplicateSheet": {
                     "sourceSheetId": source_id,
                     "newSheetName": new_tab_name,
                 }
             }
+            if tab_index is not None:
+                dup_request["duplicateSheet"]["insertSheetIndex"] = tab_index
 
             self.sheets.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
-                body={"requests": [request]},
+                body={"requests": [dup_request]},
             ).execute()
 
-            logger.info(f"Duplicated {source_tab_name} to {new_tab_name}")
+            # Unhide the new tab (template may be hidden)
+            new_sheet_id = self.get_tab_id(spreadsheet_id, new_tab_name)
+            if new_sheet_id is not None:
+                self.sheets.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"requests": [{
+                        "updateSheetProperties": {
+                            "properties": {
+                                "sheetId": new_sheet_id,
+                                "hidden": False,
+                            },
+                            "fields": "hidden",
+                        }
+                    }]},
+                ).execute()
+
+            logger.info(f"Duplicated {source_tab_name} to {new_tab_name}"
+                        + (f" at index {tab_index}" if tab_index is not None else ""))
             return True
 
         except HttpError as e:
@@ -496,7 +546,7 @@ class SheetsService:
             self.sheets.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=range_name,
-                valueInputOption="RAW",
+                valueInputOption="USER_ENTERED",
                 body={"values": values_to_write},
             ).execute()
 
@@ -540,4 +590,144 @@ class SheetsService:
 
         except HttpError as e:
             logger.error(f"Failed to update processed date: {e}")
+            return False
+
+    def write_cell(
+        self,
+        spreadsheet_id: str,
+        tab_name: str,
+        cell: str,
+        value: Any,
+    ) -> bool:
+        """Write a single value to a specific cell."""
+        try:
+            range_name = f"'{tab_name}'!{cell}"
+            self.sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=range_name,
+                valueInputOption="USER_ENTERED",
+                body={"values": [[value]]},
+            ).execute()
+            return True
+        except HttpError as e:
+            logger.error(f"Failed to write to {tab_name}!{cell}: {e}")
+            return False
+
+    def get_existing_row_count(
+        self,
+        spreadsheet_id: str,
+        tab_name: str,
+        starting_cell: str,
+    ) -> int:
+        """
+        Count the number of data rows currently in a tab starting from starting_cell.
+
+        Reads column A (or whatever column the starting_cell is in) and counts
+        non-empty rows from the starting row downward.
+
+        Returns:
+            Number of existing data rows (0 if empty or error)
+        """
+        try:
+            match = re.match(r"([A-Z]+)(\d+)", starting_cell.upper())
+            if not match:
+                return 0
+
+            col = match.group(1)
+            start_row = int(match.group(2))
+
+            # Read the first column of data to count rows
+            range_name = f"'{tab_name}'!{col}{start_row}:{col}"
+            result = self.sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=range_name,
+            ).execute()
+
+            values = result.get("values", [])
+            # Count rows that have any content
+            count = 0
+            for row in values:
+                if row and row[0] != "":
+                    count += 1
+                else:
+                    # Stop at first empty row
+                    break
+
+            return count
+
+        except HttpError as e:
+            logger.error(f"Failed to count rows in {tab_name}: {e}")
+            return 0
+
+    def get_tab_sheet_id(
+        self,
+        spreadsheet_id: str,
+        tab_name: str,
+    ) -> Optional[int]:
+        """Get the internal sheet ID for a tab (needed for insertDimension)."""
+        try:
+            meta = self.sheets.spreadsheets().get(
+                spreadsheetId=spreadsheet_id,
+                fields="sheets.properties",
+            ).execute()
+            for sheet in meta.get("sheets", []):
+                if sheet["properties"]["title"] == tab_name:
+                    return sheet["properties"]["sheetId"]
+            return None
+        except HttpError as e:
+            logger.error(f"Failed to get sheet ID for {tab_name}: {e}")
+            return None
+
+    def insert_rows(
+        self,
+        spreadsheet_id: str,
+        tab_name: str,
+        row_index: int,
+        num_rows: int,
+    ) -> bool:
+        """
+        Insert blank rows at a specific position in a tab.
+
+        This shifts existing rows (and their formulas) down, keeping
+        cross-tab references intact.
+
+        Args:
+            spreadsheet_id: Google Sheet ID
+            tab_name: Tab name
+            row_index: 0-based row index where to insert
+            num_rows: Number of blank rows to insert
+
+        Returns:
+            True if successful
+        """
+        try:
+            sheet_id = self.get_tab_sheet_id(spreadsheet_id, tab_name)
+            if sheet_id is None:
+                logger.error(f"Could not find sheet ID for {tab_name}")
+                return False
+
+            request_body = {
+                "requests": [{
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": row_index,
+                            "endIndex": row_index + num_rows,
+                        },
+                        "inheritFromBefore": True,
+                    }
+                }]
+            }
+
+            self.sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body=request_body,
+            ).execute()
+
+            logger.info(f"Inserted {num_rows} rows at row {row_index + 1} in {tab_name}")
+            return True
+
+        except HttpError as e:
+            logger.error(f"Failed to insert rows in {tab_name}: {e}")
             return False
