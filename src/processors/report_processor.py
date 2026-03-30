@@ -244,6 +244,27 @@ class ReportProcessor:
                     )
                     logger.info(f"    Wrote report date {report_date} to A1")
 
+                    # Write today's date to the next empty row in ARDashboard C
+                    # so the dashboard tracks when each AR snapshot was created.
+                    # Find the row after the last one with a real tab (E is a
+                    # number, not "No Tab") — that's the next available slot.
+                    ar_data = self.sheets.read_range(
+                        dest_sheet_id, "ARDashboard", "C8:E",
+                    )
+                    if ar_data:
+                        last_real_idx = -1
+                        for idx, row in enumerate(ar_data):
+                            col_e = row[2].strip() if len(row) > 2 else ""
+                            if col_e and col_e.upper() != "NO TAB":
+                                last_real_idx = idx
+                        # Next row after last real tab
+                        ar_row_num = 8 + last_real_idx + 1
+                        self.sheets.write_cell(
+                            dest_sheet_id, "ARDashboard",
+                            f"C{ar_row_num}", report_date,
+                        )
+                        logger.info(f"    Wrote AR date to ARDashboard C{ar_row_num}")
+
                 if not report.rows:
                     results[key] = {"status": "success", "rows": 0, "error": ""}
                     logger.info(f"  \u2713 {key}: 0 rows (empty report, nothing to write)")

@@ -318,12 +318,13 @@ class VerificationProcessor:
         result: VerificationResult,
         ar_id: str,
     ) -> None:
-        """Auto-extend ARDashboard rows when only 1 empty row remains.
+        """Auto-extend ARDashboard rows when few future slots remain.
 
-        An 'empty' row = Column E says 'No Tab' AND Column C is blank.
-        If only 1 such row exists, copy it 90 times.
+        A future slot = Column E says 'No Tab' (the row has formulas for
+        date/week/tab-name but no actual AR tab exists yet).
+        If 5 or fewer future slots remain, copy the last row 90 times
+        (formulas auto-increment the dates).
         """
-        # Read columns C and E starting from row 2 (skip header)
         rows = self._sheets.read_range(ar_id, "ARDashboard", "A2:E")
         if not rows:
             result.checks.append(VerificationCheck(
@@ -333,38 +334,48 @@ class VerificationProcessor:
             ))
             return
 
-        # Count empty rows: Col C (index 2) is blank AND Col E (index 4) says "No Tab"
-        empty_row_indices = []  # 0-based index within the rows list
+        # Find the last row with a real value in E (not "No Tab")
+        # then count "No Tab" rows after it
+        last_real_idx = -1
         for i, row in enumerate(rows):
-            col_c = row[2].strip() if len(row) > 2 else ""
             col_e = row[4].strip() if len(row) > 4 else ""
-            if col_c == "" and col_e.upper() == "NO TAB":
-                empty_row_indices.append(i)
+            if col_e and col_e.upper() != "NO TAB":
+                last_real_idx = i
 
-        if len(empty_row_indices) <= 1:
-            # Need to extend — find the last empty row (the one to copy)
-            if empty_row_indices:
-                # 1-based sheet row = index + 2 (data starts at row 2)
-                source_row = empty_row_indices[-1] + 2
-            else:
-                # No empty rows at all — use the very last data row
-                source_row = len(rows) + 1  # last row with data (1-based)
+        no_tab_count = 0
+        for row in rows[last_real_idx + 1:]:
+            col_e = row[4].strip() if len(row) > 4 else ""
+            if col_e.upper() == "NO TAB":
+                no_tab_count += 1
 
+        if no_tab_count <= 5:
+            # Copy the very last row (its formulas will auto-increment)
+            source_row = len(rows) + 1  # 1-based sheet row (data starts row 2)
             ok = self._sheets.copy_row_down(ar_id, "ARDashboard", source_row, 90)
+            if ok:
+                # Clear column A on all new rows so quarter markers from the
+                # source row don't propagate — _ar_quarter_markers will write
+                # markers only where a real quarter transition occurs.
+                first_new_row = source_row + 1
+                clear_range = f"'ARDashboard'!A{first_new_row}:A{first_new_row + 89}"
+                self._sheets._shared.service.spreadsheets().values().clear(
+                    spreadsheetId=ar_id,
+                    range=clear_range,
+                    body={},
+                ).execute()
+                logger.info(f"AR auto-extend: copied row {source_row} x90, cleared A{first_new_row}:A{first_new_row + 89}")
+            else:
+                logger.error("AR auto-extend: copy failed")
             result.checks.append(VerificationCheck(
                 name="AR auto-extend",
                 passed=ok,
                 detail=f"Copied row {source_row} x90" if ok else "COPY FAILED",
             ))
-            if ok:
-                logger.info(f"AR auto-extend: copied row {source_row} x90")
-            else:
-                logger.error("AR auto-extend: copy failed")
         else:
             result.checks.append(VerificationCheck(
                 name="AR auto-extend",
                 passed=True,
-                detail=f"{len(empty_row_indices)} empty rows remaining — no extension needed",
+                detail=f"{no_tab_count} future slots remaining — no extension needed",
             ))
 
     def _ar_quarter_markers(
