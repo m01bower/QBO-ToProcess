@@ -1,15 +1,20 @@
-"""Google Sheets service for QBO ToProcess."""
+"""Google Sheets service for FinancialSysUpdate.
+
+Delegates core Sheets API operations to the shared SheetsService module.
+Project-specific methods (tab duplication, row insertion, config readers,
+etc.) remain in this wrapper.
+
+Auth: supports both OAuth (credential_ref) and service account
+(pre-authenticated credentials passed to shared module).
+"""
 
 import re
+import sys
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 from google.oauth2 import service_account
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build, Resource
 from googleapiclient.errors import HttpError
 
 from config import GOOGLE_SCOPES, TOPROCESS_TAB_NAME, AUTOPROCESS_TAB_NAME
@@ -18,15 +23,24 @@ from settings import (
     get_google_credentials_path,
     get_google_token_path,
     save_google_token,
-    load_google_token,
 )
 from logger_setup import get_logger
 
 logger = get_logger()
 
+# ── Import shared SheetsService ──────────────────────────────────────
+_SHARED_CONFIG = Path(__file__).parent.parent.parent.parent / "_shared_config"
+sys.path.insert(0, str(_SHARED_CONFIG))
+from integrations.sheets_service import SheetsService as _SharedSheetsService  # noqa: E402
+sys.path.pop(0)
+
 
 class SheetsService:
-    """Service for interacting with Google Sheets."""
+    """Service for interacting with Google Sheets.
+
+    Wraps the shared SheetsService for core operations while
+    adding FinancialSysUpdate-specific methods.
+    """
 
     def __init__(
         self,
@@ -42,7 +56,7 @@ class SheetsService:
         """
         self.auth_method = auth_method
         self.client_name = client_name
-        self._service: Optional[Resource] = None
+        self._shared: Optional[_SharedSheetsService] = None
         self._credentials = None
 
     def authenticate(self) -> bool:
@@ -69,73 +83,49 @@ class SheetsService:
             logger.error(f"Service account file not found: {sa_path}")
             return False
 
-        self._credentials = service_account.Credentials.from_service_account_file(
+        creds = service_account.Credentials.from_service_account_file(
             str(sa_path),
             scopes=GOOGLE_SCOPES,
         )
-        self._service = build("sheets", "v4", credentials=self._credentials)
+        self._shared = _SharedSheetsService(
+            credentials=creds,
+            scopes=GOOGLE_SCOPES,
+        )
+        self._credentials = creds
         logger.info("Authenticated with Google Sheets (service account)")
         return True
 
     def _authenticate_oauth(self) -> bool:
         """Authenticate using OAuth (browser flow)."""
-        creds = None
-        token_path = get_google_token_path(self.client_name)
+        # Use shared module with credential_ref for standard OAuth
+        # However, FinancialSysUpdate uses per-client credential paths
+        # and custom token saving, so we set explicit paths
         credentials_path = get_google_credentials_path(self.client_name)
+        token_path = get_google_token_path(self.client_name)
 
-        # Load existing token if available
-        if token_path.exists():
-            try:
-                creds = Credentials.from_authorized_user_file(str(token_path), GOOGLE_SCOPES)
-            except Exception as e:
-                logger.warning(f"Failed to load existing token: {e}")
+        self._shared = _SharedSheetsService(
+            credentials_path=credentials_path,
+            token_path=token_path,
+            scopes=GOOGLE_SCOPES,
+        )
 
-        # If no valid credentials, initiate OAuth flow
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                except Exception as e:
-                    logger.warning(f"Token refresh failed: {e}")
-                    creds = None
+        if not self._shared.authenticate():
+            return False
 
-            if not creds:
-                if not credentials_path.exists():
-                    logger.error(f"Google credentials.json not found at {credentials_path}")
-                    logger.error("Download OAuth credentials from Google Cloud Console")
-                    return False
-
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    str(credentials_path),
-                    GOOGLE_SCOPES,
-                )
-                creds = flow.run_local_server(port=0)
-
-            # Save the token for future use
-            save_google_token(self.client_name, {
-                "token": creds.token,
-                "refresh_token": creds.refresh_token,
-                "token_uri": creds.token_uri,
-                "client_id": creds.client_id,
-                "client_secret": creds.client_secret,
-                "scopes": creds.scopes,
-            })
-
-        self._credentials = creds
-        self._service = build("sheets", "v4", credentials=creds)
+        self._credentials = self._shared.credentials
         logger.info(f"Authenticated with Google Sheets (OAuth - {self.client_name})")
         return True
 
     def is_authenticated(self) -> bool:
         """Check if already authenticated."""
-        return self._service is not None
+        return self._shared is not None
 
     @property
-    def sheets(self) -> Resource:
+    def sheets(self):
         """Get the Sheets API service."""
-        if not self._service:
+        if not self._shared:
             raise RuntimeError("Not authenticated. Call authenticate() first.")
-        return self._service
+        return self._shared.service
 
     def read_toprocess_config(
         self,
@@ -152,12 +142,9 @@ class SheetsService:
         """
         try:
             # First, get the year from A1
-            year_result = self.sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{TOPROCESS_TAB_NAME}'!A1",
-            ).execute()
-
-            year_value = year_result.get("values", [[None]])[0][0]
+            year_value = self._shared.read_cell(
+                TOPROCESS_TAB_NAME, "A1", spreadsheet_id
+            )
             try:
                 year = int(year_value)
             except (ValueError, TypeError):
@@ -165,19 +152,14 @@ class SheetsService:
                 logger.warning(f"Could not parse year from A1, using current year: {year}")
 
             # Get all data from row 2 onwards (row 1 is headers)
-            data_result = self.sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{TOPROCESS_TAB_NAME}'!A2:Q100",
-            ).execute()
-
-            rows = data_result.get("values", [])
+            rows = self._shared.read_range(
+                f"'{TOPROCESS_TAB_NAME}'!A2:Q100", spreadsheet_id
+            )
 
             # Also get headers
-            header_result = self.sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{TOPROCESS_TAB_NAME}'!A1:Q1",
-            ).execute()
-            headers = header_result.get("values", [[]])[0]
+            headers = self._shared.read_range(
+                f"'{TOPROCESS_TAB_NAME}'!A1:Q1", spreadsheet_id
+            )
 
             # Map column letters to indices
             col_map = {
@@ -293,12 +275,9 @@ class SheetsService:
         """
         try:
             # Get the year from A1
-            year_result = self.sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{AUTOPROCESS_TAB_NAME}'!A1",
-            ).execute()
-
-            year_value = year_result.get("values", [[None]])[0][0]
+            year_value = self._shared.read_cell(
+                AUTOPROCESS_TAB_NAME, "A1", spreadsheet_id
+            )
             try:
                 year = int(year_value)
             except (ValueError, TypeError):
@@ -306,12 +285,9 @@ class SheetsService:
                 logger.warning(f"Could not parse year from A1, using current year: {year}")
 
             # Get all data from row 3 onwards (row 1 = year, row 2 = headers)
-            data_result = self.sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{AUTOPROCESS_TAB_NAME}'!A3:F100",
-            ).execute()
-
-            rows = data_result.get("values", [])
+            rows = self._shared.read_range(
+                f"'{AUTOPROCESS_TAB_NAME}'!A3:F100", spreadsheet_id
+            )
 
             configs = []
             for row_idx, row in enumerate(rows):
@@ -371,16 +347,12 @@ class SheetsService:
         Returns:
             True if accessible
         """
-        try:
-            result = self.sheets.spreadsheets().get(
-                spreadsheetId=spreadsheet_id,
-            ).execute()
-            title = result.get("properties", {}).get("title", "Unknown")
-            logger.info(f"Verified access to: {title}")
-            return True
-        except HttpError as e:
-            logger.error(f"Cannot access spreadsheet {spreadsheet_id}: {e}")
-            return False
+        success, result = self._shared.test_access(spreadsheet_id)
+        if success:
+            logger.info(f"Verified access to: {result}")
+        else:
+            logger.error(f"Cannot access spreadsheet {spreadsheet_id}: {result}")
+        return success
 
     def get_tab_id(self, spreadsheet_id: str, tab_name: str) -> Optional[int]:
         """
@@ -393,19 +365,7 @@ class SheetsService:
         Returns:
             Sheet ID or None if not found
         """
-        try:
-            result = self.sheets.spreadsheets().get(
-                spreadsheetId=spreadsheet_id,
-            ).execute()
-
-            for sheet in result.get("sheets", []):
-                props = sheet.get("properties", {})
-                if props.get("title") == tab_name:
-                    return props.get("sheetId")
-
-            return None
-        except HttpError:
-            return None
+        return self._shared.get_sheet_id(tab_name, spreadsheet_id)
 
     def delete_tab(self, spreadsheet_id: str, tab_name: str) -> bool:
         """Delete a tab from a spreadsheet."""
@@ -414,14 +374,10 @@ class SheetsService:
             if sheet_id is None:
                 return True  # Already gone
 
-            self.sheets.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={"requests": [{
-                    "deleteSheet": {"sheetId": sheet_id}
-                }]},
-            ).execute()
-            logger.info(f"Deleted tab: {tab_name}")
-            return True
+            return self._shared.batch_update(
+                [{"deleteSheet": {"sheetId": sheet_id}}],
+                spreadsheet_id,
+            )
         except HttpError as e:
             logger.error(f"Failed to delete tab {tab_name}: {e}")
             return False
@@ -472,17 +428,14 @@ class SheetsService:
             if tab_index is not None:
                 dup_request["duplicateSheet"]["insertSheetIndex"] = tab_index
 
-            self.sheets.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={"requests": [dup_request]},
-            ).execute()
+            if not self._shared.batch_update([dup_request], spreadsheet_id):
+                return False
 
             # Unhide the new tab (template may be hidden)
             new_sheet_id = self.get_tab_id(spreadsheet_id, new_tab_name)
             if new_sheet_id is not None:
-                self.sheets.spreadsheets().batchUpdate(
-                    spreadsheetId=spreadsheet_id,
-                    body={"requests": [{
+                self._shared.batch_update(
+                    [{
                         "updateSheetProperties": {
                             "properties": {
                                 "sheetId": new_sheet_id,
@@ -490,8 +443,9 @@ class SheetsService:
                             },
                             "fields": "hidden",
                         }
-                    }]},
-                ).execute()
+                    }],
+                    spreadsheet_id,
+                )
 
             logger.info(f"Duplicated {source_tab_name} to {new_tab_name}"
                         + (f" at index {tab_index}" if tab_index is not None else ""))
@@ -530,14 +484,7 @@ class SheetsService:
 
             # Clear from starting cell to end of sheet
             range_name = f"'{tab_name}'!{col}{row}:ZZ"
-
-            self.sheets.spreadsheets().values().clear(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
-            ).execute()
-
-            logger.debug(f"Cleared {tab_name} from {starting_cell}")
-            return True
+            return self._shared.clear_range(range_name, spreadsheet_id)
 
         except HttpError as e:
             logger.error(f"Failed to clear tab: {e}")
@@ -570,30 +517,129 @@ class SheetsService:
             logger.warning(f"No data to write to {tab_name}")
             return True, 0
 
+        values_to_write = []
+        if include_headers and headers:
+            values_to_write.append(headers)
+        values_to_write.extend(data)
+
+        range_name = f"'{tab_name}'!{starting_cell}"
+        success = self._shared.write_range(range_name, values_to_write, spreadsheet_id)
+        return success, len(data) if success else 0
+
+    def apply_category_alignment(
+        self,
+        spreadsheet_id: str,
+        tab_name: str,
+        starting_cell: str,
+        row_depths: List[int],
+        row_labels: List[str],
+        include_headers: bool = False,
+    ) -> bool:
+        """Apply horizontal alignment to the category column based on depth.
+
+        Depth 0-1 and any row containing "Total": LEFT alignment.
+        Depth 2+: RIGHT alignment.
+        Only touches the horizontalAlignment property of the category column —
+        no other formatting (font, color, borders, etc.) is modified.
+
+        Args:
+            spreadsheet_id: Google Sheet ID.
+            tab_name: Tab name.
+            starting_cell: Cell where data starts (e.g. "B8").
+            row_depths: List of depth values per data row.
+            include_headers: Whether a header row was written before data.
+        """
+        if not row_depths:
+            return True
+
+        service = self._shared.service
+        if not service:
+            return False
+
+        # Parse starting cell to get column and row
+        match = re.match(r"([A-Z]+)(\d+)", starting_cell.upper())
+        if not match:
+            return False
+        col_letter = match.group(1)
+        start_row = int(match.group(2))
+        col_index = 0
+        for ch in col_letter:
+            col_index = col_index * 26 + (ord(ch) - ord("A"))
+
+        # Offset for header row
+        data_start_row = start_row + (1 if include_headers else 0)
+
+        # Get the sheet's GID
         try:
-            values_to_write = []
-
-            if include_headers and headers:
-                values_to_write.append(headers)
-
-            values_to_write.extend(data)
-
-            range_name = f"'{tab_name}'!{starting_cell}"
-
-            self.sheets.spreadsheets().values().update(
+            meta = service.spreadsheets().get(
                 spreadsheetId=spreadsheet_id,
-                range=range_name,
-                valueInputOption="USER_ENTERED",
-                body={"values": values_to_write},
+                fields="sheets.properties",
             ).execute()
+            sheet_id = None
+            for sheet in meta.get("sheets", []):
+                if sheet["properties"]["title"] == tab_name:
+                    sheet_id = sheet["properties"]["sheetId"]
+                    break
+            if sheet_id is None:
+                return False
+        except Exception:
+            return False
 
-            rows_written = len(data)
-            logger.info(f"Wrote {rows_written} rows to {tab_name}!{starting_cell}")
-            return True, rows_written
+        def _get_alignment(idx: int) -> str:
+            """LEFT for depth 0-1 or any Total row; RIGHT for depth 2+."""
+            if row_depths[idx] <= 1:
+                return "LEFT"
+            if idx < len(row_labels) and "total" in row_labels[idx].lower():
+                return "LEFT"
+            return "RIGHT"
 
-        except HttpError as e:
-            logger.error(f"Failed to write data: {e}")
-            return False, 0
+        # Build batch requests — group consecutive rows with same alignment
+        requests = []
+        i = 0
+        while i < len(row_depths):
+            align = _get_alignment(i)
+            j = i + 1
+            while j < len(row_depths):
+                if _get_alignment(j) != align:
+                    break
+                j += 1
+
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": data_start_row + i - 1,
+                        "endRowIndex": data_start_row + j - 1,
+                        "startColumnIndex": col_index,
+                        "endColumnIndex": col_index + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "horizontalAlignment": align,
+                        }
+                    },
+                    "fields": "userEnteredFormat.horizontalAlignment",
+                }
+            })
+            i = j
+
+        if requests:
+            try:
+                logger.info(f"Applying alignment to {tab_name}: {len(requests)} ranges")
+                for req in requests:
+                    r = req["repeatCell"]["range"]
+                    a = req["repeatCell"]["cell"]["userEnteredFormat"]["horizontalAlignment"]
+                    logger.debug(f"  align {a}: rows {r['startRowIndex']}-{r['endRowIndex']} col {r['startColumnIndex']}")
+                result = service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"requests": requests},
+                ).execute()
+                logger.info(f"Alignment applied to {tab_name}: {len(result.get('replies', []))} replies")
+            except Exception as e:
+                logger.error(f"Failed to apply alignment to {tab_name}: {e}")
+                return False
+
+        return True
 
     def update_processed_date(
         self,
@@ -614,23 +660,36 @@ class SheetsService:
         Returns:
             True if successful
         """
-        try:
-            tab = tab_name or TOPROCESS_TAB_NAME
-            timestamp = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
-            range_name = f"'{tab}'!{processed_col}{row_index}"
+        tab = tab_name or TOPROCESS_TAB_NAME
+        timestamp = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+        range_name = f"'{tab}'!{processed_col}{row_index}"
+        return self._shared.write_range(
+            range_name, [[timestamp]], spreadsheet_id, value_input_option="RAW"
+        )
 
-            self.sheets.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
-                valueInputOption="RAW",
-                body={"values": [[timestamp]]},
-            ).execute()
+    def read_cell(
+        self,
+        spreadsheet_id: str,
+        tab_name: str,
+        cell: str,
+    ) -> Optional[str]:
+        """Read a single cell value. Returns None if empty or on error."""
+        value = self._shared.read_cell(tab_name, cell, spreadsheet_id)
+        if value == "":
+            return None
+        return str(value) if value is not None else None
 
-            return True
-
-        except HttpError as e:
-            logger.error(f"Failed to update processed date: {e}")
-            return False
+    def read_column(
+        self,
+        spreadsheet_id: str,
+        tab_name: str,
+        column: str,
+        start_row: int = 1,
+    ) -> list[str]:
+        """Read all values in a column from start_row down. Returns list of strings."""
+        range_name = f"'{tab_name}'!{column}{start_row}:{column}"
+        rows = self._shared.read_range(range_name, spreadsheet_id)
+        return [row[0] if row else "" for row in rows]
 
     def write_cell(
         self,
@@ -640,18 +699,7 @@ class SheetsService:
         value: Any,
     ) -> bool:
         """Write a single value to a specific cell."""
-        try:
-            range_name = f"'{tab_name}'!{cell}"
-            self.sheets.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
-                valueInputOption="USER_ENTERED",
-                body={"values": [[value]]},
-            ).execute()
-            return True
-        except HttpError as e:
-            logger.error(f"Failed to write to {tab_name}!{cell}: {e}")
-            return False
+        return self._shared.write_cell(tab_name, cell, value, spreadsheet_id)
 
     def get_existing_row_count(
         self,
@@ -677,12 +725,7 @@ class SheetsService:
 
             # Read the first column of data
             range_name = f"'{tab_name}'!{col}{start_row}:{col}"
-            result = self.sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
-            ).execute()
-
-            values = result.get("values", [])
+            values = self._shared.read_range(range_name, spreadsheet_id)
             if not values:
                 return 0
 
@@ -734,12 +777,8 @@ class SheetsService:
             start_row = int(match.group(2))
 
             range_name = f"'{tab_name}'!{col}{start_row}:{col}"
-            result = self.sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
-            ).execute()
+            values = self._shared.read_range(range_name, spreadsheet_id)
 
-            values = result.get("values", [])
             for i, row in enumerate(values):
                 if row and row[0].strip() == label.strip():
                     return start_row + i
@@ -756,18 +795,7 @@ class SheetsService:
         tab_name: str,
     ) -> Optional[int]:
         """Get the internal sheet ID for a tab (needed for insertDimension)."""
-        try:
-            meta = self.sheets.spreadsheets().get(
-                spreadsheetId=spreadsheet_id,
-                fields="sheets.properties",
-            ).execute()
-            for sheet in meta.get("sheets", []):
-                if sheet["properties"]["title"] == tab_name:
-                    return sheet["properties"]["sheetId"]
-            return None
-        except HttpError as e:
-            logger.error(f"Failed to get sheet ID for {tab_name}: {e}")
-            return None
+        return self._shared.get_sheet_id(tab_name, spreadsheet_id)
 
     def insert_rows(
         self,
@@ -797,8 +825,8 @@ class SheetsService:
                 logger.error(f"Could not find sheet ID for {tab_name}")
                 return False
 
-            request_body = {
-                "requests": [{
+            return self._shared.batch_update(
+                [{
                     "insertDimension": {
                         "range": {
                             "sheetId": sheet_id,
@@ -808,17 +836,117 @@ class SheetsService:
                         },
                         "inheritFromBefore": True,
                     }
-                }]
-            }
-
-            self.sheets.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body=request_body,
-            ).execute()
-
-            logger.info(f"Inserted {num_rows} rows at row {row_index + 1} in {tab_name}")
-            return True
+                }],
+                spreadsheet_id,
+            )
 
         except HttpError as e:
             logger.error(f"Failed to insert rows in {tab_name}: {e}")
             return False
+
+    def copy_row_down(
+        self,
+        spreadsheet_id: str,
+        tab_name: str,
+        source_row: int,
+        num_copies: int,
+    ) -> bool:
+        """Copy a row (formulas, formats, values — everything) N times below it.
+
+        Uses insertDimension to create blank rows, then copyPaste to replicate
+        the source row into each new row.
+
+        Args:
+            spreadsheet_id: Google Sheet ID
+            tab_name: Tab name
+            source_row: 1-based row number to copy
+            num_copies: Number of copies to create below source_row
+
+        Returns:
+            True if successful
+        """
+        try:
+            sheet_id = self.get_tab_sheet_id(spreadsheet_id, tab_name)
+            if sheet_id is None:
+                logger.error(f"Could not find sheet ID for {tab_name}")
+                return False
+
+            # Get the column count so we copy the full width
+            try:
+                meta = self.sheets.spreadsheets().get(
+                    spreadsheetId=spreadsheet_id,
+                    fields="sheets.properties",
+                ).execute()
+                col_count = 26  # default
+                for sheet in meta.get("sheets", []):
+                    if sheet["properties"]["sheetId"] == sheet_id:
+                        col_count = sheet["properties"].get("gridProperties", {}).get("columnCount", 26)
+                        break
+            except HttpError:
+                col_count = 26
+
+            # 0-based indices for the source row
+            src_start = source_row - 1
+            insert_at = source_row  # insert below the source row (0-based)
+
+            return self._shared.batch_update(
+                [
+                    # Step 1: Insert blank rows below the source
+                    {
+                        "insertDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": insert_at,
+                                "endIndex": insert_at + num_copies,
+                            },
+                            "inheritFromBefore": True,
+                        }
+                    },
+                    # Step 2: Copy the source row into all new rows
+                    {
+                        "copyPaste": {
+                            "source": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": src_start,
+                                "endRowIndex": src_start + 1,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": col_count,
+                            },
+                            "destination": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": insert_at,
+                                "endRowIndex": insert_at + num_copies,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": col_count,
+                            },
+                            "pasteType": "PASTE_NORMAL",
+                            "pasteOrientation": "NORMAL",
+                        }
+                    },
+                ],
+                spreadsheet_id,
+            )
+
+        except HttpError as e:
+            logger.error(f"Failed to copy row in {tab_name}: {e}")
+            return False
+
+    def read_range(
+        self,
+        spreadsheet_id: str,
+        tab_name: str,
+        range_str: str,
+    ) -> list[list[str]]:
+        """Read a rectangular range. Returns list of rows (each a list of cell values).
+
+        Args:
+            spreadsheet_id: Google Sheet ID
+            tab_name: Tab name
+            range_str: A1-notation range (e.g. "A2:E" or "C2:C")
+
+        Returns:
+            List of rows, each row a list of string values. Empty cells are "".
+        """
+        full_range = f"'{tab_name}'!{range_str}"
+        return self._shared.read_range(full_range, spreadsheet_id)

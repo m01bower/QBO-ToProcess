@@ -1,4 +1,4 @@
-"""Client selection dialog for QBO ToProcess."""
+"""Client selection dialog for FinancialSysUpdate."""
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -30,7 +30,7 @@ class ClientSelectorDialog(tk.Toplevel):
 
         super().__init__(parent)
 
-        self.title("QBO ToProcess - Select Clients")
+        self.title("FinancialSysUpdate - Select Clients")
         self.resizable(False, False)
 
         self.clients = clients or []

@@ -1,4 +1,4 @@
-"""Settings management for QBO ToProcess."""
+"""Settings management for FinancialSysUpdate."""
 
 import json
 import sys
@@ -40,6 +40,9 @@ class AppSettings:
     clients: Dict[str, ClientConfig] = field(default_factory=dict)
     use_service_account: bool = True
     test_toprocess_sheet_id: str = ""
+    test_financial_dashboard_sheet_id: str = ""
+    test_ar_sheet_id: str = ""
+    test_total_cash_sheet_id: str = ""
 
     def is_configured(self) -> bool:
         """Check if basic settings are present."""
@@ -50,7 +53,7 @@ class AppSettings:
         return [name for name, cfg in self.clients.items() if cfg.enabled]
 
 
-_SHARED_APP_DIR = _SHARED_CONFIG_DIR / "apps" / "QBO_ToProcess"
+_SHARED_APP_DIR = _SHARED_CONFIG_DIR / "apps" / "FinancialSysUpdate"
 
 
 def get_config_dir() -> Path:
@@ -162,6 +165,9 @@ def load_settings() -> AppSettings:
                 redirect_uri = data.get("redirect_uri", redirect_uri)
                 environment = data.get("environment", environment)
                 test_toprocess_sheet_id = data.get("test_toprocess_sheet_id", "")
+                settings.test_financial_dashboard_sheet_id = data.get("test_financial_dashboard_sheet_id", "")
+                settings.test_ar_sheet_id = data.get("test_ar_sheet_id", "")
+                settings.test_total_cash_sheet_id = data.get("test_total_cash_sheet_id", "")
         except (json.JSONDecodeError, IOError) as e:
             print(f"Warning: Could not load QBO app settings from file: {e}")
 
@@ -188,7 +194,7 @@ def load_settings() -> AppSettings:
     # Load client config from MasterConfig (the only source of truth)
     master = get_master_config()
 
-    # Get clients that have QBO ToProcess active
+    # Get clients that have FinancialSysUpdate active
     active_keys = master.get_active_clients("QBO", tool_feature="toprocess_active")
 
     for client_key in master.list_clients():

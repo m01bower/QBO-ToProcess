@@ -1,4 +1,4 @@
-"""Configuration constants for QBO ToProcess."""
+"""Configuration constants for FinancialSysUpdate."""
 
 # QuickBooks API Configuration
 QBO_AUTH_ENDPOINT = "https://appcenter.intuit.com/connect/oauth2"
@@ -12,6 +12,7 @@ QBO_SCOPES = ["com.intuit.quickbooks.accounting"]
 # Google API Scopes
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/gmail.send",
 ]
 
 # ToProcess tab configuration
@@ -70,7 +71,7 @@ REPORT_BASIS = {
     "Accrual": "Accrual",
 }
 
-# Settings file names (stored in _shared_config/apps/QBO_ToProcess/)
+# Settings file names (stored in _shared_config/apps/FinancialSysUpdate/)
 SETTINGS_FILE = "settings.json"
 SERVICE_ACCOUNT_FILE = "service_account.json"
 QBO_APP_FILE = "qbo_app.json"

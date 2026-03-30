@@ -1,4 +1,4 @@
-# QBO ToProcess .gitignore
+# FinancialSysUpdate .gitignore
 
 # Config directory - contains secrets
 config/

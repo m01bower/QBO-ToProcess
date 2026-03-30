@@ -246,7 +246,7 @@ def export_reports(
             qbo.inject_missing_accounts(report_data, all_accounts)
 
         # Parse with MAX_ALL to get everything
-        rows, headers = qbo.parse_report_to_rows(
+        rows, headers, _depths = qbo.parse_report_to_rows(
             report_data,
             row_max=MAX_ALL,
             col_max=MAX_ALL,

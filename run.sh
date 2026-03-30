@@ -1,5 +1,5 @@
 #!/bin/bash
-# QBO ToProcess - Shell script runner
+# FinancialSysUpdate - Shell script runner
 # Run with: ./run.sh or bash run.sh
 
 cd "$(dirname "$0")"

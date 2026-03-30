@@ -1,5 +1,5 @@
 @echo off
-REM QBO ToProcess - Batch file runner
+REM FinancialSysUpdate - Batch file runner
 REM This file can be used with Windows Task Scheduler for automated runs
 
 cd /d "%~dp0"

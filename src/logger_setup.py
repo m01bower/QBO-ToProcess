@@ -1,4 +1,4 @@
-"""Structured logging setup for QBO ToProcess."""
+"""Structured logging setup for FinancialSysUpdate."""
 
 import logging
 import sys
@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 def setup_logger(
-    name: str = "qbo_toprocess",
+    name: str = "financial_sys_update",
     log_to_file: bool = True,
     log_level: int = logging.INFO,
 ) -> logging.Logger:
@@ -45,7 +45,7 @@ def setup_logger(
         log_dir = Path(__file__).parent.parent / "logs"
         log_dir.mkdir(exist_ok=True)
 
-        log_file = log_dir / f"qbo_toprocess_{datetime.now().strftime('%Y%m%d')}.log"
+        log_file = log_dir / f"financial_sys_update_{datetime.now().strftime('%Y%m%d')}.log"
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setLevel(log_level)
         file_format = logging.Formatter(
@@ -57,6 +57,6 @@ def setup_logger(
     return logger
 
 
-def get_logger(name: str = "qbo_toprocess") -> logging.Logger:
+def get_logger(name: str = "financial_sys_update") -> logging.Logger:
     """Get an existing logger or create a new one."""
     return logging.getLogger(name)

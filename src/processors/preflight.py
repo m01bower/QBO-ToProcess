@@ -1,4 +1,4 @@
-"""Pre-flight checks for QBO ToProcess.
+"""Pre-flight checks for FinancialSysUpdate.
 
 Validates all resources are accessible before any data processing begins.
 """

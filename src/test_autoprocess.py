@@ -265,7 +265,7 @@ def run_autoprocess(
             continue
 
         # Parse report to rows
-        rows, headers = qbo.parse_report_to_rows(
+        rows, headers, _depths = qbo.parse_report_to_rows(
             report_data,
             row_max=MAX_ALL,
             col_max=MAX_ALL,

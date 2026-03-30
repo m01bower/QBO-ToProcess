@@ -1,4 +1,4 @@
-"""Main entry point for QBO ToProcess."""
+"""Main entry point for FinancialSysUpdate."""
 
 import sys
 import argparse
@@ -18,6 +18,8 @@ from services.qbo_service import QBOService
 from services.sheets_service import SheetsService
 from processors.report_processor import ReportProcessor
 from processors.preflight import run_preflight, run_preflight_from_configs
+from processors.verification import VerificationProcessor
+from services.notification_service import NotificationService
 
 
 def run_setup() -> bool:
@@ -38,7 +40,7 @@ def run_setup() -> bool:
             sys.exit(0)
 
     print("\n" + "=" * 60)
-    print("QBO ToProcess - Setup Wizard")
+    print("FinancialSysUpdate - Setup Wizard")
     print("(Press Ctrl+C to cancel)")
     print("=" * 60 + "\n")
 
@@ -228,11 +230,15 @@ def process_client(client_name: str, settings: AppSettings,
         logger.warning(f"Client {client_name} is disabled in MasterConfig")
         return 1
 
-    # Load report configs from MasterConfig
+    # Load report configs and notification settings from MasterConfig
     from settings import get_master_config
     master = get_master_config()
     master_sheet_id = master.sheet_id
     reports_tab = f"Reports_{client_name}"
+
+    mc_client = master.get_client(client_name)
+    # NotificationService created after Sheets auth so we can pass credentials
+    notifier = None  # initialized after sheets.authenticate()
 
     mc_reports = master.get_qbo_reports(client_name)
     mc_year = master.get_qbo_report_year(client_name)
@@ -261,6 +267,13 @@ def process_client(client_name: str, settings: AppSettings,
         logger.error(f"Failed to authenticate with Google Sheets for {client_name}")
         return 1
 
+    # Now that Sheets is authenticated, create NotificationService with shared
+    # credentials so Gmail reuses the same access token (includes gmail.send scope)
+    notifier = NotificationService(
+        client_name, mc_client.notifications,
+        google_credentials=sheets._credentials,
+    )
+
     # Initialize QBO service
     qbo = QBOService(settings.qbo_app, client_name)
 
@@ -273,9 +286,14 @@ def process_client(client_name: str, settings: AppSettings,
 
     if not preflight_result.all_passed:
         logger.error("\nPre-flight checks FAILED:")
+        failure_lines = []
         for failure in preflight_result.failures:
             logger.error(f"  \u2717 {failure['name']}: {failure['detail']}")
+            failure_lines.append(f"  {failure['name']}: {failure['detail']}")
         logger.error("\nAborting. Fix the issues above and try again.")
+        notifier.send_alert(
+            f"Pre-flight FAILED — aborting run\n" + "\n".join(failure_lines)
+        )
         return 1
 
     # ── Two-phase processing ──
@@ -287,14 +305,40 @@ def process_client(client_name: str, settings: AppSettings,
         reports_tab=reports_tab,
     )
 
-    # Print summary
+    # Send per-error alerts
+    report_results = {k: v for k, v in results.items() if not k.startswith("_row_change_")}
+    for report, result in report_results.items():
+        if result.get("status") == "error":
+            notifier.send_alert(f"{report}: {result.get('error', 'Unknown error')}")
+
+    # ── Post-write verification ──
+    # In test mode, swap verification sheet IDs to test copies so we can
+    # run full verification (including writes) without touching production.
+    verify_sheets_config = mc_client.sheets
+    if sheet_override is not None:
+        from dataclasses import replace
+        overrides = {}
+        if settings.test_toprocess_sheet_id:
+            overrides["toprocess_sheet_id"] = settings.test_toprocess_sheet_id
+        if settings.test_financial_dashboard_sheet_id:
+            overrides["financial_dashboard_sheet_id"] = settings.test_financial_dashboard_sheet_id
+        if settings.test_ar_sheet_id:
+            overrides["ar_sheet_id"] = settings.test_ar_sheet_id
+        if settings.test_total_cash_sheet_id:
+            overrides["total_cash_sheet_id"] = settings.test_total_cash_sheet_id
+        if overrides:
+            verify_sheets_config = replace(verify_sheets_config, **overrides)
+            logger.info("Test mode — verification using test sheet IDs")
+
+    verifier = VerificationProcessor(sheets, verify_sheets_config, year_val)
+    verification = verifier.run(results)
+
+    # Print report summary to console
     print(f"\n{'=' * 60}")
     print(f"SUMMARY — {client_name}")
     print(f"{'=' * 60}")
 
-    # Separate row-change flags from report results
     row_changes = {k: v for k, v in results.items() if k.startswith("_row_change_")}
-    report_results = {k: v for k, v in results.items() if not k.startswith("_row_change_")}
 
     success_count = sum(1 for r in report_results.values() if r.get("status") == "success")
     error_count = sum(1 for r in report_results.values() if r.get("status") == "error")
@@ -311,7 +355,6 @@ def process_client(client_name: str, settings: AppSettings,
         else:
             print(f"  \u2717 {report}: {error}")
 
-    # Alert on row changes that may require manual verification
     if row_changes:
         print(f"\n{'!' * 60}")
         print("ROW CHANGES DETECTED — verify dependent tabs:")
@@ -319,15 +362,81 @@ def process_client(client_name: str, settings: AppSettings,
         for change_key, info in row_changes.items():
             tab = info.get("tab", "")
             added = info.get("rows_added", 0)
-            print(f"  \u26a0 {tab}: {added} row(s) inserted — check formulas in other tabs")
+            print(f"  \u26a0 {tab}: {added} row(s) added — check formulas in other tabs")
 
-    return 0 if error_count == 0 else 1
+    # Print verification summary
+    for line in verification.summary_lines():
+        print(line)
+
+    # Send verification failures as alerts
+    for check in verification.checks:
+        if not check.passed:
+            notifier.send_alert(f"Verification FAIL: {check.name} — {check.detail}")
+
+    # Send notifications (include verification in summary)
+    verification_text = "\n".join(verification.summary_lines())
+    notifier.send_summary(results, year_val, verification_text)
+
+    has_errors = error_count > 0 or not verification.all_passed
+    return 0 if not has_errors else 1
+
+
+def process_all_clients(settings: AppSettings) -> int:
+    """
+    Process all enabled ToProcess clients in sequence.
+
+    Each client runs independently — a failure in one does not stop the others.
+
+    Returns:
+        Exit code (0 if all succeeded, 1 if any failed)
+    """
+    logger = get_logger()
+
+    from settings import get_master_config
+    master = get_master_config()
+    active_clients = master.get_active_clients("QBO", tool_feature="toprocess_active")
+
+    if not active_clients:
+        logger.error("No active ToProcess clients found in MasterConfig")
+        return 1
+
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"Processing {len(active_clients)} clients: {', '.join(active_clients)}")
+    logger.info(f"{'=' * 60}")
+
+    client_results = {}
+    for client_name in active_clients:
+        logger.info(f"\n>>> Starting {client_name}")
+        try:
+            exit_code = process_client(client_name, settings)
+            client_results[client_name] = exit_code
+        except Exception as e:
+            logger.error(f"Unhandled error processing {client_name}: {e}")
+            client_results[client_name] = 1
+
+    # Print overall summary
+    print(f"\n{'=' * 60}")
+    print(f"ALL CLIENTS SUMMARY")
+    print(f"{'=' * 60}\n")
+
+    all_ok = True
+    for client_name, code in client_results.items():
+        status = "\u2713" if code == 0 else "\u2717"
+        print(f"  {status} {client_name}")
+        if code != 0:
+            all_ok = False
+
+    passed = sum(1 for c in client_results.values() if c == 0)
+    failed = sum(1 for c in client_results.values() if c != 0)
+    print(f"\n{passed} passed, {failed} failed")
+
+    return 0 if all_ok else 1
 
 
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="QBO ToProcess - Export QuickBooks reports to Google Sheets"
+        description="FinancialSysUpdate - Export QuickBooks reports to Google Sheets"
     )
     parser.add_argument(
         "--setup",
@@ -343,7 +452,7 @@ def main():
         "--client",
         metavar="CLIENT",
         required=False,
-        help="Client to process",
+        help="Client to process (or 'all' for all enabled clients)",
     )
     parser.add_argument(
         "--sheet",
@@ -380,9 +489,9 @@ def main():
         print("  python src/main.py --setup")
         sys.exit(1)
 
-    # Determine client
+    # Determine client(s)
     if not args.client:
-        print("Error: --client is required. Specify which client to process.")
+        print("Error: --client is required. Specify a client name or 'all'.")
         print(f"Available clients: {', '.join(settings.get_enabled_clients())}")
         sys.exit(1)
 
@@ -395,7 +504,14 @@ def main():
         sheet_override = settings.test_toprocess_sheet_id
         print(f"TEST MODE: Using test sheet {sheet_override}")
 
-    exit_code = process_client(args.client, settings, sheet_override=sheet_override)
+    if args.client.lower() == "all":
+        if sheet_override:
+            print("Error: --sheet/--test cannot be used with --client all")
+            sys.exit(1)
+        exit_code = process_all_clients(settings)
+    else:
+        exit_code = process_client(args.client, settings, sheet_override=sheet_override)
+
     sys.exit(exit_code)
 
 

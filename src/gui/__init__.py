@@ -1,4 +1,4 @@
-"""GUI package for QBO ToProcess."""
+"""GUI package for FinancialSysUpdate."""
 
 from gui.client_selector import ClientSelectorDialog, select_clients
 

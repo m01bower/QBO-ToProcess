@@ -1,18 +1,24 @@
-"""QuickBooks Online API service."""
+"""QuickBooks Online API service.
 
-import json
+Thin wrapper around the shared QBO module at _shared_config/integrations/qbo_service.py.
+Delegates token management, API requests, and token refresh to the shared module.
+Keeps project-specific logic: report fetching/parsing, Chart of Accounts merge,
+interactive auth flows, and HTTP callback handlers.
+"""
+
+import re
 import time
 import webbrowser
-from datetime import datetime, date
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlencode, urlparse, parse_qs
 from collections import defaultdict
+from datetime import date
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, Dict, Any, List, Tuple, Set
-from dataclasses import dataclass
-import threading
+from urllib.parse import urlencode, urlparse, parse_qs
 
 import requests
 from requests.auth import HTTPBasicAuth
+
+from integrations.qbo_service import QBOService as _QBOService
 
 from config import (
     QBO_AUTH_ENDPOINT,
@@ -129,7 +135,11 @@ class _TokenReceiverHandler(BaseHTTPRequestHandler):
 
 
 class QBOService:
-    """Service for interacting with QuickBooks Online API."""
+    """Service for interacting with QuickBooks Online API.
+
+    Composes the shared _QBOService for token management and API requests,
+    while keeping project-specific report fetching, parsing, and CoA logic.
+    """
 
     def __init__(self, app_settings: QBOAppSettings, client_name: str):
         """
@@ -141,24 +151,45 @@ class QBOService:
         """
         self.app_settings = app_settings
         self.client_name = client_name
-        self.session = requests.Session()
-        self._token_data: Optional[dict] = None
-        self._realm_id: Optional[str] = None
 
-        # Load existing token if available
-        self._load_token()
+        # Compose the shared QBO service
+        use_sandbox = app_settings.environment == "sandbox"
+        self._qbo = _QBOService(
+            client_id=app_settings.client_id,
+            client_secret=app_settings.client_secret,
+            token_client=client_name,
+            use_sandbox=use_sandbox,
+        )
 
-    def _load_token(self) -> None:
-        """Load token from storage."""
-        token_data = load_qbo_token(self.client_name)
-        if token_data:
-            self._token_data = token_data
-            self._realm_id = token_data.get("realm_id")
-            logger.info(f"Loaded existing token for {self.client_name}")
+        # Sync token data from shared module for local access
+        self._sync_from_shared()
 
-    def _save_token(self) -> None:
-        """Save token to storage."""
+    def _sync_from_shared(self) -> None:
+        """Sync local token state from the shared module."""
+        self._token_data = None
+        self._realm_id = self._qbo.realm_id
+
+        if self._qbo.access_token:
+            self._token_data = {
+                "access_token": self._qbo.access_token,
+                "refresh_token": self._qbo.refresh_token,
+                "realm_id": self._qbo.realm_id,
+                "obtained_at": time.time(),
+                "expires_in": 3600,
+            }
+            if self._token_data:
+                logger.info(f"Loaded existing token for {self.client_name}")
+
+    def _sync_to_shared(self) -> None:
+        """Push local token state to the shared module and persist."""
         if self._token_data:
+            self._qbo.set_tokens(
+                access_token=self._token_data["access_token"],
+                refresh_token=self._token_data.get("refresh_token"),
+                realm_id=self._realm_id,
+                expires_in=self._token_data.get("expires_in", 3600),
+            )
+            # Also save via project's own persistence
             self._token_data["realm_id"] = self._realm_id
             save_qbo_token(self.client_name, self._token_data)
 
@@ -181,7 +212,7 @@ class QBOService:
             "response_type": "code",
             "scope": " ".join(QBO_SCOPES),
             "redirect_uri": self.app_settings.redirect_uri,
-            "state": f"{self.client_name}_QBO_ToProcess_{int(time.time())}",
+            "state": f"{self.client_name}_FinancialSysUpdate_{int(time.time())}",
         }
         return f"{QBO_AUTH_ENDPOINT}?{urlencode(params)}"
 
@@ -263,7 +294,7 @@ class QBOService:
         if server.token_data:
             self._token_data = server.token_data
             self._realm_id = server.token_data.get("realm_id")
-            self._save_token()
+            self._sync_to_shared()
             logger.info(f"Successfully authenticated {self.client_name}")
             return True
 
@@ -274,84 +305,31 @@ class QBOService:
 
     def _exchange_code(self, code: str, realm_id: Optional[str]) -> bool:
         """Exchange authorization code for tokens."""
-        try:
-            auth = HTTPBasicAuth(
-                self.app_settings.client_id,
-                self.app_settings.client_secret,
-            )
-
-            data = {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": self.app_settings.redirect_uri,
-            }
-
-            response = requests.post(
-                QBO_TOKEN_ENDPOINT,
-                auth=auth,
-                data=data,
-                headers={"Accept": "application/json"},
-            )
-            response.raise_for_status()
-
-            self._token_data = response.json()
-            self._token_data["obtained_at"] = time.time()
-            self._realm_id = realm_id
-            self._save_token()
-
+        success, error = self._qbo.exchange_code(
+            code=code,
+            redirect_uri=self.app_settings.redirect_uri,
+            realm_id=realm_id,
+        )
+        if success:
+            self._realm_id = realm_id or self._qbo.realm_id
+            self._sync_from_shared()
+            # Also save via project's own persistence
+            if self._token_data:
+                save_qbo_token(self.client_name, self._token_data)
             return True
-
-        except Exception as e:
-            logger.error(f"Token exchange failed: {e}")
-            return False
-
-    def _refresh_token(self) -> bool:
-        """Refresh the access token."""
-        if not self._token_data or "refresh_token" not in self._token_data:
-            return False
-
-        try:
-            auth = HTTPBasicAuth(
-                self.app_settings.client_id,
-                self.app_settings.client_secret,
-            )
-
-            data = {
-                "grant_type": "refresh_token",
-                "refresh_token": self._token_data["refresh_token"],
-            }
-
-            response = requests.post(
-                QBO_TOKEN_ENDPOINT,
-                auth=auth,
-                data=data,
-                headers={"Accept": "application/json"},
-            )
-            response.raise_for_status()
-
-            new_token = response.json()
-            new_token["obtained_at"] = time.time()
-            new_token["realm_id"] = self._realm_id
-            self._token_data = new_token
-            self._save_token()
-
-            logger.info(f"Refreshed token for {self.client_name}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Token refresh failed: {e}")
-            return False
+        logger.error(f"Token exchange failed: {error}")
+        return False
 
     def _ensure_valid_token(self) -> bool:
-        """Ensure we have a valid access token."""
+        """Ensure we have a valid access token, delegating to the shared module."""
         if not self._token_data:
             return False
 
-        # Check if token is expired (with 5 min buffer)
-        obtained_at = self._token_data.get("obtained_at", 0)
-        expires_in = self._token_data.get("expires_in", 3600)
-        if time.time() > obtained_at + expires_in - 300:
-            return self._refresh_token()
+        # Delegate expiry checking and refresh to the shared module
+        if not self._qbo.is_authenticated():
+            # Shared module's is_authenticated auto-refreshes if expired
+            self._sync_from_shared()
+            return self._qbo.is_authenticated()
 
         return True
 
@@ -362,50 +340,36 @@ class QBOService:
         params: Optional[dict] = None,
         retries: int = 3,
     ) -> Optional[dict]:
-        """Make an authenticated API request."""
+        """Make an authenticated API request.
+
+        Delegates to the shared module's api_request and parses the JSON response.
+        """
         if not self._ensure_valid_token():
             logger.error("No valid token available")
             return None
 
-        url = f"{self.api_base_url}/{self._realm_id}/{endpoint}"
-        headers = {
-            "Authorization": f"Bearer {self._token_data['access_token']}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
+        response = self._qbo.api_request(
+            method=method,
+            endpoint=endpoint,
+            params=params,
+            retries=retries,
+        )
 
-        for attempt in range(retries):
-            try:
-                response = self.session.request(
-                    method,
-                    url,
-                    headers=headers,
-                    params=params,
-                    timeout=60,
-                )
+        if response is None:
+            return None
 
-                if response.status_code == 401:
-                    # Token expired, try refresh
-                    if self._refresh_token():
-                        headers["Authorization"] = f"Bearer {self._token_data['access_token']}"
-                        continue
-                    return None
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError:
+            logger.error(f"API request failed: HTTP {response.status_code}")
+            return None
 
-                response.raise_for_status()
+        # Capture intuit_tid for Intuit support troubleshooting
+        intuit_tid = response.headers.get('intuit_tid')
+        if intuit_tid:
+            logger.debug(f"intuit_tid: {intuit_tid}")
 
-                # Capture intuit_tid for Intuit support troubleshooting
-                intuit_tid = response.headers.get('intuit_tid')
-                if intuit_tid:
-                    logger.debug(f"intuit_tid: {intuit_tid}")
-
-                return response.json()
-
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"API request failed (attempt {attempt + 1}/{retries}): {e}")
-                if attempt < retries - 1:
-                    time.sleep(1 * (attempt + 1))
-
-        return None
+        return response.json()
 
     def test_connection(self) -> bool:
         """Test the QBO API connection."""
@@ -510,7 +474,6 @@ class QBOService:
             params["report_date"] = today.isoformat()
             # Column M = aging period in days (e.g. "7", "15", "30")
             # Extract numeric value, default to 15
-            import re
             period_match = re.search(r"\d+", display)
             aging_days = int(period_match.group()) if period_match else 15
             params["aging_period"] = str(aging_days)
@@ -542,13 +505,19 @@ class QBOService:
             col_max: Column limit ("*", "T", "-T")
 
         Returns:
-            Tuple of (data_rows, headers)
+            Tuple of (data_rows, headers).
+            Each row also has a ``_depth`` attribute (int) indicating its
+            nesting level in the QBO hierarchy (0 = top section, 1 = category,
+            2 = sub-category, etc.).  Access via ``getattr(row, '_depth', 0)``
+            or through the ``row_depths`` list stored on the returned rows list
+            object (``rows.row_depths``).
         """
         if not report_data:
             return [], []
 
         headers = []
         rows = []
+        row_depths: List[int] = []
 
         # Extract columns (headers)
         columns = report_data.get("Columns", {}).get("Column", [])
@@ -557,8 +526,8 @@ class QBOService:
             headers.append(col_title)
 
         # Extract rows
-        def process_row_data(row_data: dict, depth: int = 0) -> List[List[Any]]:
-            """Recursively process row data."""
+        def process_row_data(row_data: dict, depth: int = 0) -> List[Tuple[List[Any], int]]:
+            """Recursively process row data. Returns (row, depth) tuples."""
             result = []
 
             row_type = row_data.get("type", "")
@@ -581,12 +550,12 @@ class QBOService:
             # Process header row if present
             if header and header.get("ColData"):
                 header_row = [c.get("value", "").strip() for c in header.get("ColData", [])]
-                result.append(header_row)
+                result.append((header_row, depth))
 
             # Process this row's data
             if col_data:
                 row_values = [c.get("value", "").strip() for c in col_data]
-                result.append(row_values)
+                result.append((row_values, depth))
 
             # Handle T: stop at TOTAL (include the total row but stop after)
             if row_max == "T" and is_total_row:
@@ -607,19 +576,21 @@ class QBOService:
                     if row_max == "-T":
                         pass  # Skip total
                     else:
-                        result.append(summary_row)
+                        result.append((summary_row, depth))
                         if row_max == "T":
                             return result
                 else:
-                    result.append(summary_row)
+                    result.append((summary_row, depth))
 
             return result
 
-        # Process all rows
+        # Process all rows — unpack (row, depth) tuples
         report_rows = report_data.get("Rows", {}).get("Row", [])
         for row in report_rows:
             processed = process_row_data(row)
-            rows.extend(processed)
+            for row_data, depth in processed:
+                rows.append(row_data)
+                row_depths.append(depth)
 
         # Apply column max
         if col_max in ["-T", "T"] and headers:
@@ -640,7 +611,21 @@ class QBOService:
                     headers = headers[:total_col_idx + 1]
                     rows = [r[:total_col_idx + 1] for r in rows]
 
-        return rows, headers
+        # Deduplicate row labels: when a category name appears more than once
+        # (e.g. "Cost of Goods Sold" as both section header and account),
+        # rename the second occurrence to "COGS" so downstream sheets can
+        # distinguish them.
+        seen_labels: dict[str, int] = {}
+        for row in rows:
+            if row:
+                label = str(row[0]).strip()
+                if label in seen_labels:
+                    seen_labels[label] += 1
+                    row[0] = "COGS" if label == "Cost of Goods Sold" else f"{label} ({seen_labels[label]})"
+                else:
+                    seen_labels[label] = 1
+
+        return rows, headers, row_depths
 
     # ---- Chart of Accounts merge methods ----
 
@@ -668,18 +653,26 @@ class QBOService:
         "Equity": ["Equity"],
     }
 
-    def get_accounts(self, account_types: List[str] = None) -> List[Dict[str, Any]]:
+    def get_accounts(self, account_types: List[str] = None,
+                     include_inactive: bool = True) -> List[Dict[str, Any]]:
         """
-        Fetch active accounts from Chart of Accounts.
+        Fetch accounts from Chart of Accounts.
 
         Args:
             account_types: Filter to specific account types. If None, returns all.
+            include_inactive: If True, include inactive/deleted accounts so
+                that historical rows remain stable in destination sheets.
 
         Returns:
             List of account dictionaries.
         """
+        if include_inactive:
+            query = "SELECT * FROM Account WHERE Active IN (true, false) MAXRESULTS 1000"
+        else:
+            query = "SELECT * FROM Account WHERE Active = true MAXRESULTS 1000"
+
         result = self._make_request("GET", "query", {
-            "query": "SELECT * FROM Account WHERE Active = true MAXRESULTS 1000",
+            "query": query,
             "minorversion": "75",
         })
         if not result or "QueryResponse" not in result:
@@ -745,6 +738,20 @@ class QBOService:
                      f"{len(accounts)} total in COA)")
         return report_data
 
+    # Canonical section order for P&L reports. Used when creating missing
+    # sections so they appear in the correct position.
+    _PNL_SECTION_ORDER = [
+        "Income", "CostOfGoodsSold", "COGS",
+        "Expenses", "OtherIncome", "OtherExpenses",
+    ]
+
+    # Groups that share the same account type — if one exists, treat the
+    # alias as already present so we don't create a duplicate section.
+    _SECTION_ALIASES = {
+        "COGS": "CostOfGoodsSold",
+        "CostOfGoodsSold": "COGS",
+    }
+
     def _process_sections(
         self,
         rows: List[dict],
@@ -752,12 +759,26 @@ class QBOService:
         children_map: Dict[str, List[dict]],
         present_ids: Set[str],
         num_cols: int,
+        is_top_level: bool = True,
     ) -> None:
-        """Recursively find sections that match SECTION_ACCOUNT_TYPES and inject."""
+        """Recursively find sections that match SECTION_ACCOUNT_TYPES and inject.
+
+        Also creates entirely missing sections (e.g. OtherExpenses) when the
+        COA contains accounts of a type that maps to a section absent from the
+        report.  Missing section creation only runs at the top level to avoid
+        injecting P&L sections into Balance Sheet reports.
+        """
+        existing_groups = set()
+
         for section in rows:
             group = section.get("group", "")
 
             if group in self.SECTION_ACCOUNT_TYPES:
+                existing_groups.add(group)
+                # Mark alias as existing too
+                alias = self._SECTION_ALIASES.get(group)
+                if alias:
+                    existing_groups.add(alias)
                 # This section maps to COA account types — inject missing accounts
                 matching_types = self.SECTION_ACCOUNT_TYPES[group]
                 section_accounts = [a for a in accounts if a["AccountType"] in matching_types]
@@ -793,7 +814,93 @@ class QBOService:
                 if sub_rows:
                     self._process_sections(
                         sub_rows, accounts, children_map, present_ids, num_cols,
+                        is_top_level=False,
                     )
+
+        if not is_top_level:
+            return
+
+        # Only create missing sections if this is a P&L report (has at least
+        # one existing P&L section like Income, COGS, or Expenses)
+        pnl_groups = {"Income", "CostOfGoodsSold", "COGS", "Expenses",
+                      "OtherIncome", "OtherExpenses"}
+        if not existing_groups & pnl_groups:
+            return
+
+        # Create missing sections for account types that have COA entries
+        # but no section in the report (e.g. OtherExpenses with zero activity)
+        for group, matching_types in self.SECTION_ACCOUNT_TYPES.items():
+            if group in existing_groups:
+                continue
+            # Skip if an alias group already exists (e.g. COGS vs CostOfGoodsSold)
+            alias = self._SECTION_ALIASES.get(group)
+            if alias and alias in existing_groups:
+                continue
+
+            section_accounts = [a for a in accounts if a["AccountType"] in matching_types]
+            if not section_accounts:
+                continue
+
+            # Only create top-level P&L sections here; Balance Sheet sub-groups
+            # are nested and handled by recursion above
+            if group not in self._PNL_SECTION_ORDER:
+                continue
+
+            section_ids = {a["Id"] for a in section_accounts}
+            top_level = []
+            for acct in section_accounts:
+                parent_id = None
+                if acct.get("SubAccount"):
+                    parent_id = acct.get("ParentRef", {}).get("value")
+                if not parent_id or parent_id not in section_ids:
+                    top_level.append(acct)
+            top_level.sort(key=lambda a: a["Name"])
+
+            # Build human-readable section name
+            section_label = {
+                "OtherExpenses": "Other Expenses",
+                "OtherIncome": "Other Income",
+                "CostOfGoodsSold": "Cost of Goods Sold",
+                "COGS": "Cost of Goods Sold",
+            }.get(group, group)
+
+            new_section = {
+                "Header": {"ColData": self._make_zero_coldata(
+                    section_label, "", num_cols)},
+                "Rows": {"Row": []},
+                "Summary": {"ColData": self._make_zero_coldata(
+                    f"Total {section_label}", "", num_cols)},
+                "type": "Section",
+                "group": group,
+            }
+
+            self._inject_into_rows(
+                new_section["Rows"]["Row"],
+                top_level, children_map, present_ids, num_cols,
+            )
+
+            # Insert in canonical order.
+            # Use both the PNL_SECTION_ORDER and well-known summary groups
+            # (NetOperatingIncome, NetOtherIncome, NetIncome) for positioning.
+            _FULL_ORDER = [
+                "Income", "CostOfGoodsSold", "COGS", "GrossProfit",
+                "Expenses", "NetOperatingIncome",
+                "OtherIncome", "OtherExpenses", "NetOtherIncome", "NetIncome",
+            ]
+            insert_idx = len(rows)
+            try:
+                target_pos = _FULL_ORDER.index(group)
+                for i, row in enumerate(rows):
+                    rg = row.get("group", "")
+                    if rg in _FULL_ORDER:
+                        if _FULL_ORDER.index(rg) > target_pos:
+                            insert_idx = i
+                            break
+            except ValueError:
+                pass
+            rows.insert(insert_idx, new_section)
+            existing_groups.add(group)
+            logger.info(f"Created missing report section: {section_label}")
 
     def _collect_present_ids(self, rows: List[dict], present_ids: Set[str]) -> None:
         """Recursively collect all account IDs present in report rows."""

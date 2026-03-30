@@ -1,4 +1,4 @@
-"""Report processor for QBO ToProcess.
+"""Report processor for FinancialSysUpdate.
 
 Two-phase processing:
   Phase 1 (Download): Fetch all reports from QBO into memory
@@ -31,11 +31,13 @@ class DownloadedReport:
         rows: List[List[Any]],
         headers: List[str],
         year: int,
+        row_depths: List[int] = None,
     ):
         self.config = config
         self.rows = rows
         self.headers = headers
         self.year = year
+        self.row_depths = row_depths or []
         self.report_name = config.get("qbo_report", "Unknown")
         self.dest_tab = config.get("dest_tab_name", "Unknown")
 
@@ -144,13 +146,13 @@ class ReportProcessor:
                 elif items and qbo_endpoint in ITEM_REPORT_TYPES:
                     self.qbo.inject_missing_entities(report_data, items, "Name")
 
-                rows, headers = self.qbo.parse_report_to_rows(
+                rows, headers, row_depths = self.qbo.parse_report_to_rows(
                     report_data,
                     row_max=config.get("row_max", "*"),
                     col_max=config.get("col_max", "*"),
                 )
 
-                report = DownloadedReport(config, rows, headers, year)
+                report = DownloadedReport(config, rows, headers, year, row_depths)
                 downloaded.append(report)
 
                 if rows:
@@ -332,13 +334,28 @@ class ReportProcessor:
                 )
 
                 if not success:
+                    error_msg = (f"Failed to write data to "
+                                 f"'{dest_tab_name}'!{starting_cell} "
+                                 f"in sheet {dest_sheet_id}")
                     results[key] = {
                         "status": "error",
                         "rows": 0,
-                        "error": "Failed to write data to sheet",
+                        "error": error_msg,
                     }
-                    logger.error(f"  \u2717 {key}: Failed to write to sheet")
+                    logger.error(f"  \u2717 {key}: {error_msg}")
                     continue
+
+                # Apply category alignment for P&L / Balance Sheet reports
+                if report.row_depths:
+                    labels = [str(r[0]) if r else "" for r in report.rows]
+                    self.sheets.apply_category_alignment(
+                        spreadsheet_id=dest_sheet_id,
+                        tab_name=dest_tab_name,
+                        starting_cell=starting_cell,
+                        row_depths=report.row_depths,
+                        row_labels=labels,
+                        include_headers=write_headers,
+                    )
 
                 # Update processed date in ToProcess
                 if row_index > 0:

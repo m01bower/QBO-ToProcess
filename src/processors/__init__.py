@@ -1,4 +1,4 @@
-"""Processors package for QBO ToProcess."""
+"""Processors package for FinancialSysUpdate."""
 
 from processors.report_processor import ReportProcessor
 from processors.comparison_processor import (
