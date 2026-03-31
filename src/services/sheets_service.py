@@ -367,21 +367,6 @@ class SheetsService:
         """
         return self._shared.get_sheet_id(tab_name, spreadsheet_id)
 
-    def delete_tab(self, spreadsheet_id: str, tab_name: str) -> bool:
-        """Delete a tab from a spreadsheet."""
-        try:
-            sheet_id = self.get_tab_id(spreadsheet_id, tab_name)
-            if sheet_id is None:
-                return True  # Already gone
-
-            return self._shared.batch_update(
-                [{"deleteSheet": {"sheetId": sheet_id}}],
-                spreadsheet_id,
-            )
-        except HttpError as e:
-            logger.error(f"Failed to delete tab {tab_name}: {e}")
-            return False
-
     def duplicate_tab(
         self,
         spreadsheet_id: str,
@@ -392,9 +377,9 @@ class SheetsService:
         """
         Duplicate a tab with a new name.
 
-        If the destination tab already exists, it is deleted first and
-        recreated fresh from the template. This ensures clean formatting
-        and avoids stale data (e.g. extra TOTAL rows from prior runs).
+        If the destination tab already exists, its data is cleared and
+        repopulated from the source template. This preserves the tab
+        while ensuring clean formatting.
 
         Args:
             spreadsheet_id: Google Sheet ID
@@ -411,12 +396,22 @@ class SheetsService:
                 logger.error(f"Source tab not found: {source_tab_name}")
                 return False
 
-            # Delete existing tab if present
+            # If destination tab already exists, clear it and copy data over
             existing_id = self.get_tab_id(spreadsheet_id, new_tab_name)
             if existing_id is not None:
-                logger.info(f"Deleting existing tab: {new_tab_name}")
-                if not self.delete_tab(spreadsheet_id, new_tab_name):
-                    return False
+                logger.info(f"Tab '{new_tab_name}' exists — clearing and refreshing from template")
+                self._shared.clear_range(
+                    f"'{new_tab_name}'!A1:ZZ", spreadsheet_id,
+                )
+                source_data = self._shared.read_range(
+                    f"'{source_tab_name}'!A1:ZZ", spreadsheet_id,
+                )
+                if source_data:
+                    self._shared.write_range(
+                        f"'{new_tab_name}'!A1", source_data, spreadsheet_id,
+                    )
+                logger.info(f"Refreshed '{new_tab_name}' from '{source_tab_name}'")
+                return True
 
             # Duplicate from template
             dup_request = {
