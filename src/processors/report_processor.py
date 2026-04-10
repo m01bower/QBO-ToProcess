@@ -68,20 +68,33 @@ def _resolve_item_filter(qbo: 'QBOService', filter_str: str) -> str:
     return ""
 
 
-def _sort_rows_by_total(
+def _sort_rows(
     rows: List[List[Any]],
     row_depths: List[int],
+    sort_spec: str,
 ) -> Tuple[List[List[Any]], List[int]]:
-    """Sort data rows by their last numeric column, descending.
+    """Sort data rows based on a sort specification.
 
-    Preserves section headers (depth 0) and TOTAL rows in place.
-    Only sorts leaf data rows within each section.
+    Supported formats:
+        Total Desc  — sort by last numeric column, descending
+        Total Asc   — sort by last numeric column, ascending
+        Name Asc    — sort by column A (name), ascending
+        Name Desc   — sort by column A (name), descending
+
+    TOTAL and section header rows are preserved at their positions.
 
     Returns:
         Sorted (rows, row_depths)
     """
-    def get_sort_value(row):
-        """Get the last numeric value in the row for sorting."""
+    parts = sort_spec.strip().split()
+    if len(parts) < 2:
+        return rows, row_depths
+
+    field = parts[0].lower()
+    direction = parts[1].lower()
+    reverse = direction == "desc"
+
+    def get_total_value(row):
         for cell in reversed(row):
             val = str(cell).strip().replace(",", "")
             try:
@@ -89,6 +102,11 @@ def _sort_rows_by_total(
             except (ValueError, TypeError):
                 continue
         return 0.0
+
+    def get_name_value(row):
+        return str(row[0]).strip().lower() if row else ""
+
+    sort_key = get_total_value if field == "total" else get_name_value
 
     # Separate TOTAL row from data rows
     data_rows = []
@@ -105,19 +123,17 @@ def _sort_rows_by_total(
             data_rows.append(row)
             data_depths.append(row_depths[i] if i < len(row_depths) else 0)
 
-    # Sort data rows by total value descending
     paired = list(zip(data_rows, data_depths))
-    paired.sort(key=lambda x: get_sort_value(x[0]), reverse=True)
+    paired.sort(key=lambda x: sort_key(x[0]), reverse=reverse)
 
     sorted_rows = [r for r, _ in paired]
     sorted_depths = [d for _, d in paired]
 
-    # Add TOTAL row back at the end
     if total_row is not None:
         sorted_rows.append(total_row)
         sorted_depths.append(total_depth)
 
-    logger.info(f"Sorted {len(data_rows)} rows by total descending")
+    logger.info(f"Sorted {len(data_rows)} rows by {field} {direction}")
     return sorted_rows, sorted_depths
 
 
@@ -294,11 +310,17 @@ class ReportProcessor:
                     col_max=config.get("col_max", "*"),
                 )
 
-                # For non-P&L/Balance Sheet reports: remove zero-revenue
-                # rows and sort by total descending (active only, clean output)
+                # For non-P&L/Balance Sheet reports: remove zero-revenue rows
                 if qbo_endpoint not in COA_REPORT_TYPES and rows:
                     rows, row_depths = _remove_zero_rows(rows, row_depths)
-                    rows, row_depths = _sort_rows_by_total(rows, row_depths)
+
+                # Apply sorting from config, or default Name Asc for
+                # non-P&L/Balance Sheet reports without explicit sort
+                sort_spec = config.get("sort", "")
+                if not sort_spec and qbo_endpoint not in COA_REPORT_TYPES:
+                    sort_spec = "Name Asc"
+                if sort_spec and rows:
+                    rows, row_depths = _sort_rows(rows, row_depths, sort_spec)
 
                 report = DownloadedReport(config, rows, headers, year, row_depths)
                 downloaded.append(report)
