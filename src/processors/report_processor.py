@@ -377,33 +377,39 @@ class ReportProcessor:
                 # Handle special AR process (create new tab from template)
                 if temp_tab and new_tab_name_format:
                     if new_tab_name_format.lower() == "yyyy-mm-dd":
-                        # Use config year + today's month/day
                         today = date.today()
                         actual_tab_name = f"{report.year}-{today.strftime('%m-%d')}"
                     else:
                         actual_tab_name = new_tab_name_format
 
-                    # Parse tab index position
-                    # Config value is the desired position (e.g. 3 = 3rd tab)
-                    # Sheets API index is 0-based, so subtract 1
-                    tab_index_str = config.get("tab_index", "")
-                    tab_index = None
-                    if tab_index_str:
-                        try:
-                            tab_index = max(0, int(tab_index_str) - 1)
-                        except ValueError:
-                            pass
+                    # Check if today's tab already exists
+                    tab_exists = self.sheets.get_tab_id(
+                        dest_sheet_id, actual_tab_name
+                    ) is not None
 
-                    if not self.sheets.duplicate_tab(
-                        dest_sheet_id, temp_tab, actual_tab_name, tab_index=tab_index,
-                    ):
-                        results[key] = {
-                            "status": "error",
-                            "rows": 0,
-                            "error": f"Failed to duplicate {temp_tab} to {actual_tab_name}",
-                        }
-                        logger.error(f"  \u2717 {key}: Failed to duplicate template tab")
-                        continue
+                    if tab_exists:
+                        # Tab already exists — update it with fresh data
+                        logger.info(f"    Tab '{actual_tab_name}' already exists — updating")
+                    else:
+                        # Create new tab from template
+                        tab_index_str = config.get("tab_index", "")
+                        tab_index = None
+                        if tab_index_str:
+                            try:
+                                tab_index = max(0, int(tab_index_str) - 1)
+                            except ValueError:
+                                pass
+
+                        if not self.sheets.duplicate_tab(
+                            dest_sheet_id, temp_tab, actual_tab_name, tab_index=tab_index,
+                        ):
+                            results[key] = {
+                                "status": "error",
+                                "rows": 0,
+                                "error": f"Failed to duplicate {temp_tab} to {actual_tab_name}",
+                            }
+                            logger.error(f"  \u2717 {key}: Failed to duplicate template tab")
+                            continue
 
                     dest_tab_name = actual_tab_name
 
@@ -414,26 +420,33 @@ class ReportProcessor:
                     )
                     logger.info(f"    Wrote run timestamp {run_timestamp} to A1")
 
-                    # Write today's date to the next empty row in ARDashboard C
-                    # so the dashboard tracks when each AR snapshot was created.
-                    # Find the row with the max (newest) date in column C —
-                    # the next row after that is the slot to write to.
+                    # Write today's date to ARDashboard C — but only if
+                    # today's date isn't already there
+                    today_str = date.today().strftime("%-m/%-d/%Y")
+                    today_str2 = date.today().strftime("%m/%d/%Y")
                     ar_dates = self.sheets.read_range(
                         dest_sheet_id, "ARDashboard", "C8:C",
                     )
                     if ar_dates:
+                        # Check if today is already in column C
+                        today_already = False
                         last_date_idx = -1
                         for idx, row in enumerate(ar_dates):
                             val = row[0].strip() if row and row[0] else ""
                             if val and val.upper() != "NO TAB":
                                 last_date_idx = idx
-                        # Next row after the last date
-                        ar_row_num = 8 + last_date_idx + 1
-                        self.sheets.write_cell(
-                            dest_sheet_id, "ARDashboard",
-                            f"C{ar_row_num}", run_timestamp,
-                        )
-                        logger.info(f"    Wrote AR date to ARDashboard C{ar_row_num}")
+                                if val == today_str or val == today_str2 or val.startswith(today_str2.split()[0]):
+                                    today_already = True
+
+                        if today_already:
+                            logger.info(f"    ARDashboard already has today's date — skipping")
+                        else:
+                            ar_row_num = 8 + last_date_idx + 1
+                            self.sheets.write_cell(
+                                dest_sheet_id, "ARDashboard",
+                                f"C{ar_row_num}", run_timestamp,
+                            )
+                            logger.info(f"    Wrote AR date to ARDashboard C{ar_row_num}")
 
                 if not report.rows:
                     results[key] = {"status": "success", "rows": 0, "error": ""}
