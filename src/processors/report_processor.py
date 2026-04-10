@@ -499,9 +499,11 @@ class ReportProcessor:
 
                 # Write data to destination (overwrite in place — do NOT clear,
                 # as other columns may contain formulas)
-                # For template-based tabs (AR), don't write headers — the
-                # template already has formatted labels
-                write_headers = not is_new_tab
+                # Skip headers for:
+                #   - Template tabs (AR) — template has formatted labels
+                #   - Display=Total reports — header is just "Total", not useful
+                display = config.get("report_display", "").lower()
+                write_headers = not is_new_tab and display != "total"
                 success, rows_written = self.sheets.write_data(
                     spreadsheet_id=dest_sheet_id,
                     tab_name=dest_tab_name,
