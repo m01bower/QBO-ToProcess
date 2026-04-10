@@ -525,11 +525,17 @@ class QBOService:
         rows = []
         row_depths: List[int] = []
 
-        # Extract columns (headers)
+        # Extract columns (headers), expanding sub-columns when present
+        # (e.g. ItemSales has Quantity/Amount/%/AvgPrice per month)
         columns = report_data.get("Columns", {}).get("Column", [])
         for col in columns:
             col_title = col.get("ColTitle", "").strip()
-            headers.append(col_title)
+            sub_cols = col.get("Columns", {}).get("Column", [])
+            if sub_cols and col_title:
+                for sc in sub_cols:
+                    headers.append(f"{col_title} - {sc.get('ColTitle', '')}")
+            else:
+                headers.append(col_title)
 
         # Extract rows
         def process_row_data(row_data: dict, depth: int = 0) -> List[Tuple[List[Any], int]]:
