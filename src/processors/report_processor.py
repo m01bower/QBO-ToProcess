@@ -184,6 +184,74 @@ def _remove_zero_rows(
     return filtered_rows, filtered_depths
 
 
+def _insert_pct_change(
+    rows: List[List[Any]],
+    headers: List[str],
+) -> Tuple[List[List[Any]], List[str]]:
+    """Insert % Change columns after each PY column in comparison reports.
+
+    QBO returns [Name, Curr1, PY1, Curr2, PY2, ..., CurrT, PYT]
+    We produce [Name, Curr1, PY1, %Chg1, Curr2, PY2, %Chg2, ..., CurrT, PYT, %ChgT]
+
+    The % Change is calculated as (Current - PY) / PY * 100, formatted
+    as a percentage string (e.g. "-82.13%").
+    """
+    if not rows:
+        return rows, headers
+
+    # Data columns come in pairs (Current, PY) after the name column
+    # Number of periods = (total cols - 1) / 2
+    num_data_cols = len(rows[0]) - 1
+    if num_data_cols < 2 or num_data_cols % 2 != 0:
+        logger.warning(f"Unexpected column count for comparison: {len(rows[0])}")
+        return rows, headers
+
+    num_periods = num_data_cols // 2
+
+    new_rows = []
+    for row in rows:
+        new_row = [row[0]]  # Name column
+        for p in range(num_periods):
+            curr_idx = 1 + p * 2
+            py_idx = 2 + p * 2
+            curr_val = row[curr_idx] if curr_idx < len(row) else ""
+            py_val = row[py_idx] if py_idx < len(row) else ""
+
+            new_row.append(curr_val)
+            new_row.append(py_val)
+
+            # Calculate % Change
+            try:
+                curr_num = float(str(curr_val).replace(",", "").replace("$", "")) if curr_val else 0
+                py_num = float(str(py_val).replace(",", "").replace("$", "")) if py_val else 0
+                if py_num != 0:
+                    pct = ((curr_num - py_num) / abs(py_num)) * 100
+                    new_row.append(f"{pct:.2f}%")
+                elif curr_num != 0:
+                    new_row.append("")  # Can't calculate % change from zero
+                else:
+                    new_row.append("")
+            except (ValueError, TypeError):
+                new_row.append("")
+
+        new_rows.append(new_row)
+
+    # Expand headers: insert "% Change (PY)" after each PY header
+    new_headers = [headers[0]] if headers else [""]
+    for p in range(num_periods):
+        h_idx = 1 + p  # Original headers are just period names
+        if h_idx < len(headers):
+            new_headers.append(headers[h_idx])
+        else:
+            new_headers.append("")
+        new_headers.append("")  # PY (no separate header in QBO)
+        new_headers.append("% Change (PY)")
+
+    logger.info(f"Inserted % Change columns: {len(rows[0])} -> {len(new_rows[0])} cols "
+                f"({num_periods} periods)")
+    return new_rows, new_headers
+
+
 class DownloadedReport:
     """Holds a downloaded and parsed QBO report ready for insertion."""
 
@@ -278,6 +346,11 @@ class ReportProcessor:
                     if item_ids:
                         extra_params["item"] = item_ids
 
+                # Comparison reports need prior year sub-columns from QBO
+                is_comparison = "comparison" in report_name.lower()
+                if is_comparison:
+                    extra_params["subcol_py"] = "true"
+
                 report_data = self.qbo.get_report(
                     report_name=report_name,
                     year=year,
@@ -309,6 +382,12 @@ class ReportProcessor:
                     row_max=config.get("row_max", "*"),
                     col_max=config.get("col_max", "*"),
                 )
+
+                # Comparison reports: insert calculated % Change column
+                # after each PY column. QBO gives [Current, PY] per period,
+                # we need [Current, PY, % Change] to match Excel format.
+                if is_comparison and rows:
+                    rows, headers = _insert_pct_change(rows, headers)
 
                 # For non-P&L/Balance Sheet reports: remove zero-revenue rows
                 if qbo_endpoint not in COA_REPORT_TYPES and rows:
