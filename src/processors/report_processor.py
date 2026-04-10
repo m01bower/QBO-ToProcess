@@ -534,11 +534,14 @@ class ReportProcessor:
 
                 # Write data to destination (overwrite in place — do NOT clear,
                 # as other columns may contain formulas)
-                # Skip headers for:
+                # Skip headers when:
                 #   - Template tabs (AR) — template has formatted labels
-                #   - Display=Total reports — header is just "Total", not useful
+                #   - Display=Total — header is just "Total", not useful
+                #   - Sub-columns exist (data cols > header cols) — sheet
+                #     already has a multi-row header layout
                 display = config.get("report_display", "").lower()
-                write_headers = not is_new_tab and display != "total"
+                has_sub_cols = len(report.rows[0]) > len(report.headers) if report.rows and report.headers else False
+                write_headers = not is_new_tab and display != "total" and not has_sub_cols
                 success, rows_written = self.sheets.write_data(
                     spreadsheet_id=dest_sheet_id,
                     tab_name=dest_tab_name,
