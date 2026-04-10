@@ -13,6 +13,8 @@ from services.sheets_service import SheetsService
 from config import QBO_REPORTS
 from logger_setup import get_logger
 
+import re
+
 logger = get_logger()
 
 # Report types that use Chart of Accounts (need zero-balance account injection)
@@ -20,6 +22,150 @@ COA_REPORT_TYPES = {"ProfitAndLoss", "BalanceSheet"}
 # Report types that use Customers or Items (need entity injection)
 CUSTOMER_REPORT_TYPES = {"CustomerSales"}
 ITEM_REPORT_TYPES = {"ItemSales"}
+
+
+def _resolve_item_filter(qbo: 'QBOService', filter_str: str) -> str:
+    """Resolve a filter expression to QBO item IDs.
+
+    Supported formats:
+        contains:text     — items whose name contains 'text'
+        exact:text        — items whose name exactly matches 'text'
+
+    Returns:
+        Comma-separated item IDs for the QBO API, or empty string.
+    """
+    if ":" not in filter_str:
+        logger.warning(f"Invalid filter format '{filter_str}' — expected 'contains:text'")
+        return ""
+
+    mode, value = filter_str.split(":", 1)
+    mode = mode.strip().lower()
+    value = value.strip()
+
+    if not value:
+        return ""
+
+    items = qbo.get_items()
+    if not items:
+        logger.warning("No items returned from QBO for filter resolution")
+        return ""
+
+    matched = []
+    for item in items:
+        name = item.get("Name", "")
+        if mode == "contains" and value.lower() in name.lower():
+            matched.append(item)
+        elif mode == "exact" and name.lower() == value.lower():
+            matched.append(item)
+
+    if matched:
+        ids = ",".join(i["Id"] for i in matched)
+        names = ", ".join(i["Name"] for i in matched)
+        logger.info(f"Filter '{filter_str}' matched {len(matched)} items: {names}")
+        return ids
+
+    logger.warning(f"Filter '{filter_str}' matched no items")
+    return ""
+
+
+def _sort_rows_by_total(
+    rows: List[List[Any]],
+    row_depths: List[int],
+) -> Tuple[List[List[Any]], List[int]]:
+    """Sort data rows by their last numeric column, descending.
+
+    Preserves section headers (depth 0) and TOTAL rows in place.
+    Only sorts leaf data rows within each section.
+
+    Returns:
+        Sorted (rows, row_depths)
+    """
+    def get_sort_value(row):
+        """Get the last numeric value in the row for sorting."""
+        for cell in reversed(row):
+            val = str(cell).strip().replace(",", "")
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                continue
+        return 0.0
+
+    # Separate TOTAL row from data rows
+    data_rows = []
+    data_depths = []
+    total_row = None
+    total_depth = None
+
+    for i, row in enumerate(rows):
+        label = str(row[0]).strip() if row else ""
+        if label.upper() == "TOTAL":
+            total_row = row
+            total_depth = row_depths[i] if i < len(row_depths) else 0
+        else:
+            data_rows.append(row)
+            data_depths.append(row_depths[i] if i < len(row_depths) else 0)
+
+    # Sort data rows by total value descending
+    paired = list(zip(data_rows, data_depths))
+    paired.sort(key=lambda x: get_sort_value(x[0]), reverse=True)
+
+    sorted_rows = [r for r, _ in paired]
+    sorted_depths = [d for _, d in paired]
+
+    # Add TOTAL row back at the end
+    if total_row is not None:
+        sorted_rows.append(total_row)
+        sorted_depths.append(total_depth)
+
+    logger.info(f"Sorted {len(data_rows)} rows by total descending")
+    return sorted_rows, sorted_depths
+
+
+def _remove_zero_rows(
+    rows: List[List[Any]],
+    row_depths: List[int],
+) -> Tuple[List[List[Any]], List[int]]:
+    """Remove rows where all numeric columns are zero or empty.
+
+    Preserves TOTAL and section header rows.
+
+    Returns:
+        Filtered (rows, row_depths)
+    """
+    filtered_rows = []
+    filtered_depths = []
+    removed = 0
+
+    for i, row in enumerate(rows):
+        label = str(row[0]).strip() if row else ""
+        depth = row_depths[i] if i < len(row_depths) else 0
+
+        # Always keep TOTAL and section headers
+        if label.upper() == "TOTAL" or depth == 0:
+            filtered_rows.append(row)
+            filtered_depths.append(depth)
+            continue
+
+        # Check if any numeric column has a non-zero value
+        has_value = False
+        for cell in row[1:]:
+            val = str(cell).strip().replace(",", "")
+            try:
+                if float(val) != 0:
+                    has_value = True
+                    break
+            except (ValueError, TypeError):
+                continue
+
+        if has_value:
+            filtered_rows.append(row)
+            filtered_depths.append(depth)
+        else:
+            removed += 1
+
+    if removed:
+        logger.info(f"Removed {removed} zero-revenue rows")
+    return filtered_rows, filtered_depths
 
 
 class DownloadedReport:
@@ -120,6 +266,14 @@ class ReportProcessor:
                 else:
                     dr = "Year"
 
+                # Resolve API-level item filter if configured
+                row_filter = config.get("filter", "")
+                extra_params = {}
+                if row_filter:
+                    item_ids = _resolve_item_filter(self.qbo, row_filter)
+                    if item_ids:
+                        extra_params["item"] = item_ids
+
                 report_data = self.qbo.get_report(
                     report_name=report_name,
                     year=year,
@@ -127,6 +281,7 @@ class ReportProcessor:
                     basis=config.get("report_basis", "Accrual"),
                     full_year=True,
                     date_range=dr,
+                    extra_params=extra_params,
                 )
 
                 if not report_data:
@@ -138,19 +293,28 @@ class ReportProcessor:
                     continue
 
                 # Inject zero-balance rows for missing accounts/customers/items
+                # Skip injection when filter is active (filtered reports
+                # intentionally exclude unmatched entities)
                 qbo_endpoint = QBO_REPORTS.get(report_name, "")
-                if coa_accounts and qbo_endpoint in COA_REPORT_TYPES:
-                    self.qbo.inject_missing_accounts(report_data, coa_accounts)
-                elif customers and qbo_endpoint in CUSTOMER_REPORT_TYPES:
-                    self.qbo.inject_missing_entities(report_data, customers, "DisplayName")
-                elif items and qbo_endpoint in ITEM_REPORT_TYPES:
-                    self.qbo.inject_missing_entities(report_data, items, "Name")
+                if not row_filter:
+                    if coa_accounts and qbo_endpoint in COA_REPORT_TYPES:
+                        self.qbo.inject_missing_accounts(report_data, coa_accounts)
+                    elif customers and qbo_endpoint in CUSTOMER_REPORT_TYPES:
+                        self.qbo.inject_missing_entities(report_data, customers, "DisplayName")
+                    elif items and qbo_endpoint in ITEM_REPORT_TYPES:
+                        self.qbo.inject_missing_entities(report_data, items, "Name")
 
                 rows, headers, row_depths = self.qbo.parse_report_to_rows(
                     report_data,
                     row_max=config.get("row_max", "*"),
                     col_max=config.get("col_max", "*"),
                 )
+
+                # Remove zero-revenue rows and sort by total descending
+                # when a filter is active
+                if row_filter and rows:
+                    rows, row_depths = _remove_zero_rows(rows, row_depths)
+                    rows, row_depths = _sort_rows_by_total(rows, row_depths)
 
                 report = DownloadedReport(config, rows, headers, year, row_depths)
                 downloaded.append(report)
@@ -261,7 +425,7 @@ class ReportProcessor:
                         ar_row_num = 8 + last_real_idx + 1
                         self.sheets.write_cell(
                             dest_sheet_id, "ARDashboard",
-                            f"C{ar_row_num}", report_date,
+                            f"C{ar_row_num}", run_timestamp,
                         )
                         logger.info(f"    Wrote AR date to ARDashboard C{ar_row_num}")
 

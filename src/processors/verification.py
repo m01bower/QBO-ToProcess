@@ -116,121 +116,100 @@ class VerificationProcessor:
         ar_id = self._config.ar_sheet_id
         total_cash_id = self._config.total_cash_sheet_id
 
-        # ── Write timestamps ──
-        self._write_timestamp(
-            result, toprocess_id,
-            f"{self._year} P&L Planning", "C1", now_str,
-            "P&L Planning timestamp",
-        )
+        # ── Write timestamps + ALL GOOD checks ──
+        # All checks are conditional on the tab existing in the spreadsheet.
+        # Not all clients have the same sheet structure.
+
+        pl_planning_tab = f"{self._year} P&L Planning"
+        if self._sheets.get_tab_id(toprocess_id, pl_planning_tab) is not None:
+            self._write_timestamp(
+                result, toprocess_id,
+                pl_planning_tab, "C1", now_str,
+                "P&L Planning timestamp",
+            )
+            self._check_all_good(result, toprocess_id, pl_planning_tab, "E1", "P&L Planning E1")
+            self._check_all_good(result, toprocess_id, pl_planning_tab, "I1", "P&L Planning I1")
+            self._check_all_good(result, toprocess_id, pl_planning_tab, "M1", "P&L Planning M1")
+
         if dashboard_id:
-            self._write_timestamp(
-                result, dashboard_id,
-                f"{self._year} Financial Dashboard", "C3", now_str,
-                "Financial Dashboard timestamp",
-            )
+            dashboard_tab = f"{self._year} Financial Dashboard"
+            if self._sheets.get_tab_id(dashboard_id, dashboard_tab) is not None:
+                self._write_timestamp(
+                    result, dashboard_id,
+                    dashboard_tab, "C3", now_str,
+                    "Financial Dashboard timestamp",
+                )
+                self._check_all_good(result, dashboard_id, dashboard_tab, "D1", "Financial Dashboard D1")
+
         if ar_id:
-            self._write_timestamp(
-                result, ar_id,
-                "ARDashboard", "C1", now_str,
-                "AR Dashboard timestamp",
-            )
+            if self._sheets.get_tab_id(ar_id, "ARDashboard") is not None:
+                self._write_timestamp(
+                    result, ar_id,
+                    "ARDashboard", "C1", now_str,
+                    "AR Dashboard timestamp",
+                )
+                self._check_all_good(result, ar_id, "ARDashboard", "D1", "AR Dashboard D1")
+
         if total_cash_id:
-            self._write_timestamp(
-                result, total_cash_id,
-                f"{self._year} Cash", "B1", now_str,
-                "Total Cash timestamp",
-            )
-
-        # ── ALL GOOD checks ──
-        # P&L Planning: E1, I1, M1
-        self._check_all_good(
-            result, toprocess_id,
-            f"{self._year} P&L Planning", "E1",
-            "P&L Planning E1",
-        )
-        self._check_all_good(
-            result, toprocess_id,
-            f"{self._year} P&L Planning", "I1",
-            "P&L Planning I1",
-        )
-        self._check_all_good(
-            result, toprocess_id,
-            f"{self._year} P&L Planning", "M1",
-            "P&L Planning M1",
-        )
-
-        # Financial Dashboard: D1
-        if dashboard_id:
-            self._check_all_good(
-                result, dashboard_id,
-                f"{self._year} Financial Dashboard", "D1",
-                "Financial Dashboard D1",
-            )
-
-        # AR Dashboard: D1
-        if ar_id:
-            self._check_all_good(
-                result, ar_id,
-                "ARDashboard", "D1",
-                "AR Dashboard D1",
-            )
-
-        # Total Cash: B2
-        if total_cash_id:
-            self._check_all_good(
-                result, total_cash_id,
-                f"{self._year} Cash", "B2",
-                "Total Cash B2",
-            )
+            cash_tab = f"{self._year} Cash"
+            if self._sheets.get_tab_id(total_cash_id, cash_tab) is not None:
+                self._write_timestamp(
+                    result, total_cash_id,
+                    cash_tab, "B1", now_str,
+                    "Total Cash timestamp",
+                )
+                self._check_all_good(result, total_cash_id, cash_tab, "B2", "Total Cash B2")
 
         # ── Total Cash: verify today's date in column A ──
-        if total_cash_id:
+        if total_cash_id and self._sheets.get_tab_id(total_cash_id, f"{self._year} Cash") is not None:
             self._check_date_in_column(
                 result, total_cash_id,
                 f"{self._year} Cash", "A",
                 "Total Cash date in Col A",
             )
 
-        # ── AR Dashboard: verify today's date in column C ──
-        if ar_id:
+        # ── AR Dashboard: verify today's date, auto-extend, quarter markers ──
+        if ar_id and self._sheets.get_tab_id(ar_id, "ARDashboard") is not None:
             self._check_date_in_column(
                 result, ar_id,
                 "ARDashboard", "C",
                 "AR Dashboard date in Col C",
             )
-
-        # ── AR Dashboard: auto-extend rows if needed ──
-        if ar_id:
             self._ar_auto_extend(result, ar_id)
-
-        # ── AR Dashboard: quarter markers ──
-        if ar_id:
             self._ar_quarter_markers(result, ar_id)
 
         # ── Yearly Analysis: Review and Client Review tabs (same spreadsheet as ToProcess) ──
-        self._write_timestamp(
-            result, toprocess_id,
-            "Review", "A1", now_str,
-            "Yearly Analysis Review timestamp",
-        )
-        self._check_all_good(
-            result, toprocess_id,
-            "Review", "D1",
-            "Yearly Analysis Review D1",
-        )
-        self._write_timestamp(
-            result, toprocess_id,
-            "Client Review", "A1", now_str,
-            "Yearly Analysis Client Review timestamp",
-        )
-        self._check_all_good(
-            result, toprocess_id,
-            "Client Review", "D1",
-            "Yearly Analysis Client Review D1",
-        )
+        # Only run for tabs that exist — not all clients have these
+        if self._sheets.get_tab_id(toprocess_id, "Review") is not None:
+            self._write_timestamp(
+                result, toprocess_id,
+                "Review", "A1", now_str,
+                "Yearly Analysis Review timestamp",
+            )
+            self._check_all_good(
+                result, toprocess_id,
+                "Review", "D1",
+                "Yearly Analysis Review D1",
+            )
+        if self._sheets.get_tab_id(toprocess_id, "Client Review") is not None:
+            self._write_timestamp(
+                result, toprocess_id,
+                "Client Review", "A1", now_str,
+                "Yearly Analysis Client Review timestamp",
+            )
+            self._check_all_good(
+                result, toprocess_id,
+                "Client Review", "D1",
+                "Yearly Analysis Client Review D1",
+            )
 
         # ── Row comparison: P&L Monthly vs Monthly Forecast ──
-        self._check_row_match(result, toprocess_id)
+        # Only run if both tabs exist in the spreadsheet
+        pl_tab = f"{self._year} P&L Monthly"
+        fc_tab = f"{self._year} Monthly Forecast"
+        if (self._sheets.get_tab_id(toprocess_id, pl_tab) is not None and
+                self._sheets.get_tab_id(toprocess_id, fc_tab) is not None):
+            self._check_row_match(result, toprocess_id)
 
         return result
 

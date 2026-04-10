@@ -250,6 +250,7 @@ class SheetsService:
                 "report_basis": r.report_basis or "Accrual",
                 "tab_index": r.move_new_tab_to_index or "",
                 "verify_last_row": r.verify_last_row.upper().startswith("Y") if r.verify_last_row else False,
+                "filter": r.filter or "",
             }
             configs.append(config)
         return year, configs

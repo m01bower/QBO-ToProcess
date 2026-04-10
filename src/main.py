@@ -120,7 +120,7 @@ def run_setup() -> bool:
     active_keys = master.get_active_clients("QBO", tool_feature="toprocess_active")
     clients: Dict[str, ClientConfig] = {}
     for client_key in setup_clients:
-        mc = master.get_client(client_key)
+        mc = master.get_client(client_key, tabs=["QBO", "Google Sheets"])
         clients[client_key] = ClientConfig(
             name=client_key,
             qbo_realm_id=mc.qbo.realm_id,
@@ -236,7 +236,7 @@ def process_client(client_name: str, settings: AppSettings,
     master_sheet_id = master.sheet_id
     reports_tab = f"Reports_{client_name}"
 
-    mc_client = master.get_client(client_name)
+    mc_client = master.get_client(client_name, tabs=["QBO", "Google Sheets", "Notifications"])
     # NotificationService created after Sheets auth so we can pass credentials
     notifier = None  # initialized after sheets.authenticate()
 

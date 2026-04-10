@@ -389,6 +389,7 @@ class QBOService:
         full_year: bool = False,
         date_range: str = "Year",
         special_options: str = "",
+        extra_params: Dict[str, str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Fetch a report from QuickBooks.
@@ -484,8 +485,13 @@ class QBOService:
         if basis.lower() in ["cash", "accrual"]:
             params["accounting_method"] = basis.capitalize()
 
+        # Merge any extra parameters (e.g. item filter IDs)
+        if extra_params:
+            params.update(extra_params)
+
+        filter_info = f" [filter: {extra_params}]" if extra_params else ""
         logger.info(f"Fetching {report_name} report for {year} ({display}, {basis})"
-                     f"{f' [{special_options}]' if special_options else ''}")
+                     f"{f' [{special_options}]' if special_options else ''}{filter_info}")
 
         result = self._make_request("GET", f"reports/{qbo_report}", params)
         return result
@@ -818,6 +824,84 @@ class QBOService:
                     )
 
         if not is_top_level:
+            # For nested levels (Balance Sheet sub-groups), create missing
+            # sections ONLY as siblings of existing leaf-level groups.
+            # The Balance Sheet nesting is:
+            #   ASSETS → CurrentAssets → {BankAccounts, AR, OtherCurrentAssets}
+            #   ASSETS → {FixedAssets, OtherAssets}
+            #   LIABILITIES → CurrentLiabilities → {AP, CreditCards, OtherCurrentLiabilities}
+            #   LIABILITIES → {LongTermLiabilities}
+            #
+            # Only create sections at levels that already have sibling
+            # leaf sections (ones in SECTION_ACCOUNT_TYPES).
+            leaf_groups_here = existing_groups & set(self.SECTION_ACCOUNT_TYPES.keys())
+            if not leaf_groups_here:
+                return
+
+            # Determine sibling family based on what's already at this level
+            _CURRENT_ASSET_SIBLINGS = {"BankAccounts", "AR", "OtherCurrentAssets"}
+            _NONCURRENT_ASSET_SIBLINGS = {"FixedAssets", "OtherAssets"}
+            _CURRENT_LIABILITY_SIBLINGS = {"AP", "CreditCards", "OtherCurrentLiabilities"}
+            _NONCURRENT_LIABILITY_SIBLINGS = {"LongTermLiabilities"}
+
+            candidate_groups = set()
+            if leaf_groups_here & _CURRENT_ASSET_SIBLINGS:
+                candidate_groups = _CURRENT_ASSET_SIBLINGS
+            elif leaf_groups_here & _NONCURRENT_ASSET_SIBLINGS:
+                candidate_groups = _NONCURRENT_ASSET_SIBLINGS
+            elif leaf_groups_here & _CURRENT_LIABILITY_SIBLINGS:
+                candidate_groups = _CURRENT_LIABILITY_SIBLINGS
+            elif leaf_groups_here & _NONCURRENT_LIABILITY_SIBLINGS:
+                candidate_groups = _NONCURRENT_LIABILITY_SIBLINGS
+
+            for group in candidate_groups - existing_groups:
+                matching_types = self.SECTION_ACCOUNT_TYPES.get(group, [])
+                alias = self._SECTION_ALIASES.get(group)
+                if alias and alias in existing_groups:
+                    continue
+
+                section_accounts = [a for a in accounts if a["AccountType"] in matching_types]
+                if not section_accounts:
+                    continue
+
+                section_ids = {a["Id"] for a in section_accounts}
+                top_level = []
+                for acct in section_accounts:
+                    parent_id = None
+                    if acct.get("SubAccount"):
+                        parent_id = acct.get("ParentRef", {}).get("value")
+                    if not parent_id or parent_id not in section_ids:
+                        top_level.append(acct)
+                top_level.sort(key=lambda a: a["Name"])
+
+                section_label = {
+                    "OtherAssets": "Other Assets",
+                    "OtherCurrentAssets": "Other Current Assets",
+                    "OtherCurrentLiabilities": "Other Current Liabilities",
+                    "LongTermLiabilities": "Long Term Liabilities",
+                    "BankAccounts": "Bank Accounts",
+                    "FixedAssets": "Fixed Assets",
+                    "CreditCards": "Credit Cards",
+                }.get(group, group)
+
+                new_section = {
+                    "Header": {"ColData": self._make_zero_coldata(
+                        section_label, "", num_cols)},
+                    "Rows": {"Row": []},
+                    "Summary": {"ColData": self._make_zero_coldata(
+                        f"Total {section_label}", "", num_cols)},
+                    "type": "Section",
+                    "group": group,
+                }
+
+                self._inject_into_rows(
+                    new_section["Rows"]["Row"],
+                    top_level, children_map, present_ids, num_cols,
+                )
+
+                rows.append(new_section)
+                logger.info(f"Created missing Balance Sheet section: {section_label}")
+
             return
 
         # Only create missing sections if this is a P&L report (has at least
@@ -841,8 +925,7 @@ class QBOService:
             if not section_accounts:
                 continue
 
-            # Only create top-level P&L sections here; Balance Sheet sub-groups
-            # are nested and handled by recursion above
+            # Only create top-level P&L sections here
             if group not in self._PNL_SECTION_ORDER:
                 continue
 
@@ -987,16 +1070,19 @@ class QBOService:
                             break
             else:
                 # Account is missing — inject it
+                # Prepend account number to match QBO report format (e.g. "1006 Name")
+                acct_num = acct.get("AcctNum", "")
+                display_name = f"{acct_num} {acct_name}" if acct_num else acct_name
                 if children:
                     # Parent account with children: create a Section
                     new_section = {
                         "Header": {
-                            "ColData": self._make_zero_coldata(acct_name, acct_id, num_cols)
+                            "ColData": self._make_zero_coldata(display_name, acct_id, num_cols)
                         },
                         "Rows": {"Row": []},
                         "Summary": {
                             "ColData": self._make_zero_coldata(
-                                f"Total {acct_name}", "", num_cols
+                                f"Total {display_name}", "", num_cols
                             )
                         },
                         "type": "Section",
@@ -1009,14 +1095,14 @@ class QBOService:
                         present_ids,
                         num_cols,
                     )
-                    self._insert_sorted(existing_rows, new_section, acct_name)
+                    self._insert_sorted(existing_rows, new_section, display_name)
                 else:
                     # Leaf account: create a Data row
                     new_row = {
-                        "ColData": self._make_zero_coldata(acct_name, acct_id, num_cols),
+                        "ColData": self._make_zero_coldata(display_name, acct_id, num_cols),
                         "type": "Data",
                     }
-                    self._insert_sorted(existing_rows, new_row, acct_name)
+                    self._insert_sorted(existing_rows, new_row, display_name)
 
     def _insert_sorted(self, rows: List[dict], new_row: dict, name: str) -> None:
         """Insert a row into the list maintaining alphabetical order by name."""
